@@ -2,14 +2,10 @@ library(shiny)
 library(ggplot2)
 library(plotly) 
 
-# ==========================================
-# 1. DUMMY DATA GENERATORS (The "Placeholders")
-# Your team will replace these functions later
-# ==========================================
 
 #Simulates the 30-sec RV bins
 get_rv_data <- function(stock_id) {
-  #In reality, Gia will output a CSV that you load here:
+  #In reality, Gia will output a CSV here:
   #df <- read.csv(paste0("data/", stock_id, "_rv.csv"))
   data.frame(
     time = seq(as.POSIXct("2026-03-30 10:00:00"), by = "30 sec", length.out = 100),
