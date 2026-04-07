@@ -67,20 +67,7 @@ ols <- lm(rv ~ rv_lag1 + bas + wap + rv_roll_mean, data = train)
 
 # WLS weights
 
-# Tune to optimise hyperparameter alpha, minimising MSE
-alphas <- seq(0.7, 0.99, by = 0.01)
-results <- data.frame(alpha = alphas, mse = NA)
-
-for (i in 1:length(alphas)) {
-  a <- alphas[i]
-  train_tmp <- train %>% group_by(stock_id) %>% mutate(t = row_number(), weight = a^(max(t) - t)) %>% ungroup()
-  model <- lm(rv ~ rv_lag1 + bas + wap + rv_roll_mean, data = train_tmp, weights = weight)
-  preds <- predict(model, test)
-  results$mse[i] <- mean((test$rv - preds)^2, na.rm = TRUE)
-  }
-best_alpha <- results$alpha[which.min(results$mse)]
-
-alpha <- best_alpha
+alpha <- 0.8
 train <- train %>%
   arrange(stock_id, time_id) %>%
   group_by(stock_id) %>%
