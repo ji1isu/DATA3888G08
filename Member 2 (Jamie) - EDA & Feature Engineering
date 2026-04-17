@@ -4,9 +4,13 @@ library(ggplot2)
 library(zoo)
 library(corrplot)
 
-# Load 30-second bucket data
-data <- fread("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_30s.csv")
+data <- fread("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_aggregated.csv")
 
+
+# 1. CREATE 30-SECOND BUCKETS
+
+data <- data %>%
+  mutate(bucket_id = floor(seconds_in_bucket / 30))
 
 # 2. FEATURE ENGINEERING
 data <- data %>%
