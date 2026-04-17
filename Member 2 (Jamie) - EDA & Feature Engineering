@@ -1,88 +1,124 @@
-1. Set up
 library(data.table)
 library(dplyr)
 library(ggplot2)
 library(zoo)
 library(corrplot)
-data <- fread("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_aggregated.csv")
+
+# Load 30-second bucket data
+data <- fread("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_30s.csv")
 
 
-2.	Feature engineering
+# 2. FEATURE ENGINEERING
 data <- data %>%
-rename(
-wap = WAP_mean,
-bas = BidAskSpread_mean,
-rv = volatility
-)
+  rename(
+    wap = WAP,
+    bas = BidAskSpread,
+    rv = realised_volatility
+  )
 
+# Lag features
 data <- data %>%
-  arrange(stock_id, time_id) %>%
-  group_by(stock_id) %>%
-  mutate(rv_lag1  = lag(rv), rv_lag2  = lag(rv, 2), bas_lag1 = lag(bas), wap_lag1 = lag(wap)) %>%
+  arrange(stock_id, time_id, bucket_id) %>%
+  group_by(stock_id, time_id) %>%
+  mutate(
+    rv_lag1  = lag(rv, 1),
+    rv_lag2  = lag(rv, 2),
+    bas_lag1 = lag(bas, 1),
+    wap_lag1 = lag(wap, 1)
+  ) %>%
   ungroup()
 
+# Rolling features (using previous 5 thirty-second buckets = 2.5 mins)
 data <- data %>%
-  group_by(stock_id) %>%
-  mutate(rv_roll_mean = rollmean(rv, 5, fill = NA, align = "right"), rv_roll_sd  = rollapply(rv, 5, sd, fill = NA), bas_roll_mean = rollmean(bas, 5, fill = NA)) %>%
+  group_by(stock_id, time_id) %>%
+  mutate(
+    rv_roll_mean = rollmean(rv, 5, fill = NA, align = "right"),
+    rv_roll_sd   = rollapply(rv, 5, sd, fill = NA, align = "right"),
+    bas_roll_mean = rollmean(bas, 5, fill = NA, align = "right")
+  ) %>%
   ungroup()
 
+# Interaction terms
 data <- data %>%
-  mutate(spread_vol_interaction = bas * rv_lag1, wap_vol_interaction  = wap * rv_lag1)
+  mutate(
+    spread_vol_interaction = bas * rv_lag1,
+    wap_vol_interaction = wap * rv_lag1
+  )
 
 
-3.	EDA
+# 3. EDA
+
+# RV distribution
 ggplot(data, aes(rv)) +
   geom_histogram(bins = 50) +
-  ggtitle("Distribution of Realised Volatility")
+  ggtitle("Distribution of Realised Volatility (30s buckets)")
 
+# Spread vs RV
 ggplot(data, aes(bas, rv)) +
   geom_point(alpha = 0.3) +
   geom_smooth() +
   ggtitle("Bid-Ask Spread vs Volatility")
-# positive relationship
 
+# Example volatility clustering
 data %>%
-  filter(stock_id == 0) %>%
-  ggplot(aes(time_id, rv)) +
-    geom_line() +
-    ggtitle("Volatility Clustering Example")
+  filter(stock_id == 0, time_id == first(time_id)) %>%
+  ggplot(aes(bucket_id, rv)) +
+  geom_line() +
+  ggtitle("30s Volatility Clustering")
 
+# Correlation matrix
 corr <- data %>%
   select(rv, rv_lag1, rv_lag2, bas, wap, rv_roll_mean) %>%
   na.omit() %>%
   cor()
+
 corrplot(corr, method = "color")
 
 
-4.	WLS Regression
-# Train/test split
-set.seed(123)
-train_idx <- sample(nrow(data), 0.8 * nrow(data))
+# 4. TRAIN / VALIDATION SPLIT (8 min / 2 min)
 
-train <- data[train_idx, ]
-test  <- data[-train_idx, ]
+# 10-minute window = 20 buckets of 30 seconds
+# Use first 16 buckets for training, last 4 for validation
 
-# OLS model
-ols <- lm(rv ~ rv_lag1 + bas + wap + rv_roll_mean, data = train)
+train <- data %>% filter(bucket_id <= 16)
+test  <- data %>% filter(bucket_id > 16)
 
-# WLS weights
 
+# 5. WLS REGRESSION
+
+# OLS baseline
+ols <- lm(
+  rv ~ rv_lag1 + bas + wap + rv_roll_mean,
+  data = train
+)
+
+# Exponential decay weights
 alpha <- 0.8
+
 train <- train %>%
-  arrange(stock_id, time_id) %>%
-  group_by(stock_id) %>%
-  mutate(t = row_number(), weight = alpha^(max(t) - t)) %>%
+  group_by(stock_id, time_id) %>%
+  mutate(
+    weight = alpha^(16 - bucket_id)
+  ) %>%
   ungroup()
 
+# WLS model
+wls <- lm(
+  rv ~ rv_lag1 + bas + wap + rv_roll_mean,
+  data = train,
+  weights = weight
+)
 
-# WLS Model
-wls <- lm(rv ~ rv_lag1 + bas + wap + rv_roll_mean, data = train, weights = weight)
 
+# 6. EVALUATION
 
-5.	Evaluation
 # Predictions
 test$ols_pred <- predict(ols, test)
 test$wls_pred <- predict(wls, test)
+
+# Ensure positive predictions for QLIKE
+test$ols_pred <- pmax(test$ols_pred, 1e-8)
+test$wls_pred <- pmax(test$wls_pred, 1e-8)
 
 # MSE
 mse_ols <- mean((test$rv - test$ols_pred)^2, na.rm = TRUE)
@@ -91,7 +127,15 @@ mse_wls <- mean((test$rv - test$wls_pred)^2, na.rm = TRUE)
 # QLIKE
 qlike <- function(y, yhat) {
   mean(log(yhat) + y / yhat, na.rm = TRUE)
-  }
+}
 
 qlike_ols <- qlike(test$rv, test$ols_pred)
 qlike_wls <- qlike(test$rv, test$wls_pred)
+
+
+# 7. RESULTS
+
+cat("OLS MSE:", mse_ols, "\n")
+cat("WLS MSE:", mse_wls, "\n")
+cat("OLS QLIKE:", qlike_ols, "\n")
+cat("WLS QLIKE:", qlike_wls, "\n")
