@@ -6,9 +6,7 @@ library(corrplot)
 
 data <- fread("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_aggregated.csv")
 
-
 # 1. CREATE 30-SECOND BUCKETS
-
 data <- data %>%
   mutate(bucket_id = floor(seconds_in_bucket / 30))
 
@@ -17,7 +15,7 @@ data <- data %>%
   rename(
     wap = WAP,
     bas = BidAskSpread,
-    rv = realised_volatility
+    rv  = realised_volatility
   )
 
 # Lag features
@@ -32,12 +30,12 @@ data <- data %>%
   ) %>%
   ungroup()
 
-# Rolling features (using previous 5 thirty-second buckets = 2.5 mins)
+# Rolling features (previous 5 thirty-second buckets = 2.5 mins)
 data <- data %>%
   group_by(stock_id, time_id) %>%
   mutate(
-    rv_roll_mean = rollmean(rv, 5, fill = NA, align = "right"),
-    rv_roll_sd   = rollapply(rv, 5, sd, fill = NA, align = "right"),
+    rv_roll_mean  = rollmean(rv, 5, fill = NA, align = "right"),
+    rv_roll_sd    = rollapply(rv, 5, sd, fill = NA, align = "right"),
     bas_roll_mean = rollmean(bas, 5, fill = NA, align = "right")
   ) %>%
   ungroup()
@@ -45,101 +43,113 @@ data <- data %>%
 # Interaction terms
 data <- data %>%
   mutate(
-    spread_vol_interaction = bas * rv_lag1,
-    wap_vol_interaction = wap * rv_lag1
+    spread_vol_interaction = bas  * rv_lag1,
+    wap_vol_interaction    = wap  * rv_lag1
   )
 
-
 # 3. EDA
-
-# RV distribution
 ggplot(data, aes(rv)) +
   geom_histogram(bins = 50) +
   ggtitle("Distribution of Realised Volatility (30s buckets)")
 
-# Spread vs RV
 ggplot(data, aes(bas, rv)) +
   geom_point(alpha = 0.3) +
   geom_smooth() +
   ggtitle("Bid-Ask Spread vs Volatility")
 
-# Example volatility clustering
 data %>%
   filter(stock_id == 0, time_id == first(time_id)) %>%
   ggplot(aes(bucket_id, rv)) +
   geom_line() +
   ggtitle("30s Volatility Clustering")
 
-# Correlation matrix
 corr <- data %>%
   select(rv, rv_lag1, rv_lag2, bas, wap, rv_roll_mean) %>%
   na.omit() %>%
   cor()
-
 corrplot(corr, method = "color")
 
-
-# 4. TRAIN / VALIDATION SPLIT (8 min / 2 min)
-
-# 10-minute window = 20 buckets of 30 seconds
-# Use first 16 buckets for training, last 4 for validation
-
+# 4. TRAIN / VALIDATION SPLIT
 train <- data %>% filter(bucket_id <= 16)
-test  <- data %>% filter(bucket_id > 16)
+test  <- data %>% filter(bucket_id  > 16)
 
-
-# 5. WLS REGRESSION
-
-# OLS baseline
+# 5. OLS BASELINE
 ols <- lm(
   rv ~ rv_lag1 + bas + wap + rv_roll_mean,
   data = train
 )
 
-# Exponential decay weights
-alpha <- 0.8
-
-train <- train %>%
-  group_by(stock_id, time_id) %>%
-  mutate(
-    weight = alpha^(16 - bucket_id)
-  ) %>%
-  ungroup()
-
-# WLS model
-wls <- lm(
-  rv ~ rv_lag1 + bas + wap + rv_roll_mean,
-  data = train,
-  weights = weight
-)
-
-
-# 6. EVALUATION
-
-# Predictions
-test$ols_pred <- predict(ols, test)
-test$wls_pred <- predict(wls, test)
-
-# Ensure positive predictions for QLIKE
-test$ols_pred <- pmax(test$ols_pred, 1e-8)
-test$wls_pred <- pmax(test$wls_pred, 1e-8)
-
-# MSE
-mse_ols <- mean((test$rv - test$ols_pred)^2, na.rm = TRUE)
-mse_wls <- mean((test$rv - test$wls_pred)^2, na.rm = TRUE)
-
-# QLIKE
+# 6. ALPHA TUNING via grid search
+# ── helper: QLIKE loss ──────────────────────────────────────────────────────
 qlike <- function(y, yhat) {
   mean(log(yhat) + y / yhat, na.rm = TRUE)
 }
 
+# ── grid ────────────────────────────────────────────────────────────────────
+alpha_grid <- seq(0.1, 0.99, by = 0.01)
+
+tune_results <- data.frame(alpha = alpha_grid, qlike = NA_real_)
+
+for (i in seq_along(alpha_grid)) {
+  a <- alpha_grid[i]
+
+  # Assign exponential-decay weights on the training set
+  train_w <- train %>%
+    group_by(stock_id, time_id) %>%
+    mutate(weight = a^(16 - bucket_id)) %>%
+    ungroup()
+
+  # Fit WLS
+  fit <- lm(
+    rv ~ rv_lag1 + bas + wap + rv_roll_mean,
+    data    = train_w,
+    weights = weight
+  )
+
+  # Evaluate on held-out test set
+  preds <- pmax(predict(fit, test), 1e-8)
+  tune_results$qlike[i] <- qlike(test$rv, preds)
+}
+
+# Best alpha
+best_row   <- tune_results[which.min(tune_results$qlike), ]
+best_alpha <- best_row$alpha
+cat("Best alpha:", best_alpha, " | Validation QLIKE:", best_row$qlike, "\n")
+
+# Plot tuning curve
+ggplot(tune_results, aes(alpha, qlike)) +
+  geom_line(colour = "steelblue") +
+  geom_vline(xintercept = best_alpha, linetype = "dashed", colour = "red") +
+  labs(
+    title = "Alpha Tuning: QLIKE vs Decay Parameter",
+    x     = "Alpha",
+    y     = "Validation QLIKE"
+  )
+
+# 7. FINAL WLS MODEL with best alpha
+train <- train %>%
+  group_by(stock_id, time_id) %>%
+  mutate(weight = best_alpha^(16 - bucket_id)) %>%
+  ungroup()
+
+wls <- lm(
+  rv ~ rv_lag1 + bas + wap + rv_roll_mean,
+  data    = train,
+  weights = weight
+)
+
+# 8. EVALUATION
+test$ols_pred <- pmax(predict(ols, test), 1e-8)
+test$wls_pred <- pmax(predict(wls, test), 1e-8)
+
+mse_ols  <- mean((test$rv - test$ols_pred)^2, na.rm = TRUE)
+mse_wls  <- mean((test$rv - test$wls_pred)^2, na.rm = TRUE)
+
 qlike_ols <- qlike(test$rv, test$ols_pred)
 qlike_wls <- qlike(test$rv, test$wls_pred)
 
-
-# 7. RESULTS
-
-cat("OLS MSE:", mse_ols, "\n")
-cat("WLS MSE:", mse_wls, "\n")
-cat("OLS QLIKE:", qlike_ols, "\n")
-cat("WLS QLIKE:", qlike_wls, "\n")
+# 9. RESULTS
+cat("OLS  MSE:", mse_ols,  "\n")
+cat("WLS  MSE:", mse_wls,  "\n")
+cat("OLS  QLIKE:", qlike_ols, "\n")
+cat("WLS  QLIKE:", qlike_wls, "\n")
