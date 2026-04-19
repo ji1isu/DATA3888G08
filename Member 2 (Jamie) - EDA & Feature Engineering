@@ -80,12 +80,12 @@ ols <- lm(
 )
 
 # 6. ALPHA TUNING via grid search
-# ── helper: QLIKE loss ──────────────────────────────────────────────────────
+# helper: QLIKE loss
 qlike <- function(y, yhat) {
   mean(log(yhat) + y / yhat, na.rm = TRUE)
 }
 
-# ── grid ────────────────────────────────────────────────────────────────────
+# grid
 alpha_grid <- seq(0.1, 0.99, by = 0.01)
 
 tune_results <- data.frame(alpha = alpha_grid, qlike = NA_real_)
