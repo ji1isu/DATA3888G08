@@ -1,162 +1,530 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import seaborn as sns
 from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
 from joblib import Parallel, delayed
+import warnings
+warnings.filterwarnings("ignore")
+ 
 
-# 1. Load data
-print("Loading data...")
+# 1. LOAD DATA
+
+print("=" * 60)
+print("LOADING DATA")
+print("=" * 60)
 df = pd.read_csv("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_aggregated.csv")
 print(f"Shape: {df.shape}")
 print(df.head())
+ 
 
-# 2. Rename columns
+# 2. RENAME COLUMNS
+
 df = df.rename(columns={
-    "WAP_mean": "wap",
+    "WAP_mean":          "wap",
     "BidAskSpread_mean": "bas",
-    "volatility": "rv"
+    "volatility":        "rv"
 })
+ 
 
-# 3. Sort once
+# 3. SORT
+
 df = df.sort_values(["stock_id", "time_id", "time_bucket"]).reset_index(drop=True)
+ 
 
-# 4. Train/validate split (80/20 on time_bucket)
+# 4. TRAIN / VAL SPLIT (80/20 on time_bucket)
+
 n_buckets = df["time_bucket"].max() + 1
-n_train = int(n_buckets * 0.8)
-n_val = n_buckets - n_train
-print(f"Total buckets: {n_buckets} | Train: {n_train} | Val: {n_val}")
-
+n_train   = int(n_buckets * 0.8)
+n_val     = n_buckets - n_train
+print(f"\nTotal buckets: {n_buckets} | Train: {n_train} | Val: {n_val}")
+ 
 train = df[df["time_bucket"] <  n_train].copy()
-test = df[df["time_bucket"] >= n_train].copy()
+test  = df[df["time_bucket"] >= n_train].copy()
 print(f"Train rows: {len(train):,} | Test rows: {len(test):,}")
+ 
 
-# 5. Feature engineering
+# 5. FEATURE ENGINEERING
+#    Includes: lags, rolling stats, spread features,
+#    price momentum, order-flow proxies, interactions
+
+print("\n" + "=" * 60)
+print("FEATURE ENGINEERING")
+print("=" * 60)
+ 
 def add_features(df):
-    df = df.sort_values(["stock_id", "time_id", "time_bucket"]).copy()
+    df  = df.sort_values(["stock_id", "time_id", "time_bucket"]).copy()
     grp = df.groupby(["stock_id", "time_id"])
-
+ 
     # Lag features
-    df["rv_lag1"] = grp["rv"].shift(1)
-    df["rv_lag2"] = grp["rv"].shift(2)
+    df["rv_lag1"]  = grp["rv"].shift(1)
+    df["rv_lag2"]  = grp["rv"].shift(2)
+    df["rv_lag3"]  = grp["rv"].shift(3)
     df["bas_lag1"] = grp["bas"].shift(1)
     df["wap_lag1"] = grp["wap"].shift(1)
-
-    # Rolling features
-    df["rv_roll_mean"] = grp["rv"].rolling(5, min_periods=1).mean().values
-    df["rv_roll_sd"] = grp["rv"].rolling(5, min_periods=1).std().values
-    df["bas_roll_mean"] = grp["bas"].rolling(5, min_periods=1).mean().values
-
+    df["wap_lag2"] = grp["wap"].shift(2)
+ 
+    # Rolling features (window = 5)
+    df["rv_roll_mean"]  = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df["rv_roll_sd"]    = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).std())
+    df["rv_roll_max"]   = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).max())
+    df["bas_roll_mean"] = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df["bas_roll_sd"]   = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).std())
+    df["wap_roll_mean"] = grp["wap"].transform(lambda x: x.rolling(5, min_periods=1).mean())
+ 
+    # Spread features
+    # Relative spread (normalised by WAP)
+    df["rel_spread"]      = df["bas"] / (df["wap"] + 1e-12)
+    df["rel_spread_lag1"] = grp["rel_spread"].shift(1)
+    # Spread change
+    df["bas_change"]      = df["bas"] - df["bas_lag1"]
+    df["bas_pct_change"]  = df["bas_change"] / (df["bas_lag1"] + 1e-12)
+ 
+    # Price / order features
+    # WAP return (log)
+    df["wap_return"]      = np.log(df["wap"] / (df["wap_lag1"] + 1e-12))
+    df["wap_return2"]     = np.log(df["wap"] / (df["wap_lag2"] + 1e-12))
+    # WAP deviation from rolling mean (mean-reversion signal)
+    df["wap_dev"]         = df["wap"] - df["wap_roll_mean"]
+    # Price acceleration
+    df["wap_accel"]       = df["wap_return"] - grp["wap_return"].shift(1)
+ 
     # Interaction terms
-    df["spread_vol_interaction"] = df["bas"] * df["rv_lag1"]
-    df["wap_vol_interaction"] = df["wap"] * df["rv_lag1"]
-
+    df["spread_vol_interaction"]  = df["bas"]        * df["rv_lag1"]
+    df["wap_vol_interaction"]     = df["wap_return"]  * df["rv_lag1"]
+    df["rel_spread_vol"]          = df["rel_spread"]  * df["rv_lag1"]
+    df["spread_change_vol"]       = df["bas_change"]  * df["rv_lag1"]
+ 
+    # Squared / nonlinear terms
+    df["rv_lag1_sq"]  = df["rv_lag1"] ** 2
+    df["bas_sq"]      = df["bas"] ** 2
+    df["rv_roll_cv"]  = df["rv_roll_sd"] / (df["rv_roll_mean"] + 1e-12)   # coefficient of variation
+ 
     return df
-
+ 
 print("Engineering train features...")
 train = add_features(train)
 print("Engineering test features...")
 test  = add_features(test)
-
-# 6. EDA
-eda_sample = train.sample(50_000, random_state=42)
-
-fig, axes = plt.subplots(1, 3, figsize=(18, 4))
-
-axes[0].hist(train["rv"].dropna(), bins=50)
-axes[0].set_title("Distribution of Realised Volatility")
-axes[0].set_xlabel("rv")
-
-axes[1].scatter(eda_sample["bas"], eda_sample["rv"], alpha=0.1, s=5)
-axes[1].set_title("Bid-Ask Spread vs Volatility (50k sample)")
-axes[1].set_xlabel("bas"); axes[1].set_ylabel("rv")
-
-sample_stock = df["stock_id"].iloc[0]
-sample_tid = df[df["stock_id"] == sample_stock]["time_id"].iloc[0]
-sample = train[(train["stock_id"] == sample_stock) & (train["time_id"] == sample_tid)]
-axes[2].plot(sample["time_bucket"], sample["rv"])
-axes[2].set_title(f"Volatility Clustering (stock={sample_stock}, time_id={sample_tid})")
-axes[2].set_xlabel("time_bucket"); axes[2].set_ylabel("rv")
-
-plt.tight_layout()
-plt.show()
-
-# Correlation heatmap
-corr_cols = ["rv", "rv_lag1", "rv_lag2", "bas", "wap", "rv_roll_mean"]
-corr = train[corr_cols].dropna().corr()
-
-plt.figure(figsize=(7, 6))
-sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0)
-plt.title("Correlation Matrix")
-plt.tight_layout()
-plt.show()
-
-# 7. Prepare matrices
-FEATURES = ["rv_lag1", "bas", "wap", "rv_roll_mean"]
+ 
+all_features = [
+    # Core lags
+    "rv_lag1", "rv_lag2", "rv_lag3",
+    "bas_lag1", "wap_lag1",
+    # Rolling
+    "rv_roll_mean", "rv_roll_sd", "rv_roll_max", "rv_roll_cv",
+    "bas_roll_mean", "bas_roll_sd",
+    # Spread
+    "bas", "rel_spread", "rel_spread_lag1", "bas_change", "bas_pct_change",
+    # Price / order
+    "wap", "wap_return", "wap_return2", "wap_dev", "wap_accel",
+    # Interactions
+    "spread_vol_interaction", "wap_vol_interaction",
+    "rel_spread_vol", "spread_change_vol",
+    # Nonlinear
+    "rv_lag1_sq", "bas_sq",
+]
 TARGET = "rv"
+ 
+print(f"\nTotal engineered features: {len(all_features)}")
+ 
 
-train_clean = train.dropna(subset=FEATURES + [TARGET])
-test_clean  = test.dropna(subset=FEATURES + [TARGET])
+# 6. EDA — PARALLEL COMPUTATION
 
-X_train = train_clean[FEATURES].values
-y_train = train_clean[TARGET].values
-X_test = test_clean[FEATURES].values
-y_test = test_clean[TARGET].values
+print("\n" + "=" * 60)
+print("EDA")
+print("=" * 60)
+ 
+eda_sample = train.sample(50_000, random_state=42)
+ 
+# Parallel EDA stats per stock
+def stock_eda_stats(sid, df):
+    sub = df[df["stock_id"] == sid]["rv"].dropna()
+    return {
+        "stock_id": sid,
+        "rv_mean":  sub.mean(),
+        "rv_std":   sub.std(),
+        "rv_skew":  sub.skew(),
+        "rv_kurt":  sub.kurt(),
+        "rv_q95":   sub.quantile(0.95),
+    }
+ 
+stock_ids = train["stock_id"].unique()
+print(f"Computing per-stock EDA stats in parallel for {len(stock_ids)} stocks...")
+stock_stats = Parallel(n_jobs=-1)(
+    delayed(stock_eda_stats)(sid, train) for sid in stock_ids
+)
+stock_stats_df = pd.DataFrame(stock_stats).set_index("stock_id")
+print("\nPer-stock RV summary (first 10):")
+print(stock_stats_df.head(10).to_string())
+ 
+# Correlation analysis
+corr_cols = [
+    "rv", "rv_lag1", "rv_lag2",
+    "bas", "rel_spread", "bas_change",
+    "wap_return", "wap_dev",
+    "rv_roll_mean", "rv_roll_sd",
+    "spread_vol_interaction"
+]
+corr_matrix = eda_sample[corr_cols].dropna().corr()
+ 
+
+# 7. EDA PLOTS
+
+ 
+# Figure 1: Distributions & Scatter
+fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+fig.suptitle("EDA — Distributions & Relationships", fontsize=16, fontweight="bold")
+ 
+# RV distribution
+axes[0, 0].hist(train["rv"].dropna(), bins=100, color="steelblue", edgecolor="none")
+axes[0, 0].set_title("Distribution of Realised Volatility")
+axes[0, 0].set_xlabel("rv"); axes[0, 0].set_ylabel("Count")
+ 
+# BAS distribution
+axes[0, 1].hist(train["bas"].dropna(), bins=100, color="coral", edgecolor="none")
+axes[0, 1].set_title("Distribution of Bid-Ask Spread")
+axes[0, 1].set_xlabel("bas")
+ 
+# Relative spread distribution
+axes[0, 2].hist(eda_sample["rel_spread"].dropna(), bins=80, color="mediumpurple", edgecolor="none")
+axes[0, 2].set_title("Distribution of Relative Spread (bas/WAP)")
+axes[0, 2].set_xlabel("rel_spread")
+ 
+# BAS vs RV scatter
+axes[1, 0].scatter(eda_sample["bas"], eda_sample["rv"], alpha=0.1, s=3, color="steelblue")
+axes[1, 0].set_title("Bid-Ask Spread vs RV")
+axes[1, 0].set_xlabel("bas"); axes[1, 0].set_ylabel("rv")
+ 
+# WAP return vs RV
+axes[1, 1].scatter(eda_sample["wap_return"], eda_sample["rv"], alpha=0.1, s=3, color="coral")
+axes[1, 1].set_title("WAP Return vs RV")
+axes[1, 1].set_xlabel("wap_return"); axes[1, 1].set_ylabel("rv")
+ 
+# RV lag1 vs RV (persistence)
+axes[1, 2].scatter(eda_sample["rv_lag1"], eda_sample["rv"], alpha=0.1, s=3, color="seagreen")
+axes[1, 2].set_title("RV Lag-1 vs RV (Persistence)")
+axes[1, 2].set_xlabel("rv_lag1"); axes[1, 2].set_ylabel("rv")
+ 
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/eda_distributions.png", dpi=150)
+plt.show()
+ 
+# Figure 2: Correlation Heatmap
+plt.figure(figsize=(12, 10))
+mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+sns.heatmap(
+    corr_matrix, annot=True, fmt=".2f", cmap="coolwarm",
+    center=0, mask=mask, linewidths=0.5,
+    annot_kws={"size": 9}
+)
+plt.title("Correlation Matrix — Covariate Final Set", fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/correlation_heatmap.png", dpi=150)
+plt.show()
+ 
+# ── Figure 3: Volatility clustering + per-stock stats ─
+fig, axes = plt.subplots(1, 2, figsize=(18, 5))
+fig.suptitle("Volatility Clustering & Cross-Stock Dispersion", fontsize=14, fontweight="bold")
+ 
+# Time-series example
+sample_stock = train["stock_id"].iloc[0]
+sample_tid   = train[train["stock_id"] == sample_stock]["time_id"].iloc[0]
+sample_ts    = train[(train["stock_id"] == sample_stock) & (train["time_id"] == sample_tid)]
+axes[0].plot(sample_ts["time_bucket"], sample_ts["rv"], color="steelblue", linewidth=1.2)
+axes[0].fill_between(sample_ts["time_bucket"], sample_ts["rv"], alpha=0.2, color="steelblue")
+axes[0].set_title(f"Volatility Clustering (stock={sample_stock}, time_id={sample_tid})")
+axes[0].set_xlabel("time_bucket"); axes[0].set_ylabel("rv")
+ 
+# Per-stock RV mean distribution
+axes[1].bar(range(len(stock_stats_df)), stock_stats_df["rv_mean"].sort_values(), color="coral", width=0.8)
+axes[1].set_title("Mean RV per Stock (cross-sectional dispersion)")
+axes[1].set_xlabel("Stock rank"); axes[1].set_ylabel("Mean RV")
+ 
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/volatility_clustering.png", dpi=150)
+plt.show()
+ 
+# Figure 4: Spread features EDA
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle("Bid-Ask Spread Feature Analysis", fontsize=14, fontweight="bold")
+ 
+axes[0].scatter(eda_sample["rel_spread"], eda_sample["rv"], alpha=0.1, s=3, color="mediumpurple")
+axes[0].set_title("Relative Spread vs RV")
+axes[0].set_xlabel("rel_spread"); axes[0].set_ylabel("rv")
+ 
+axes[1].scatter(eda_sample["bas_change"], eda_sample["rv"], alpha=0.1, s=3, color="darkorange")
+axes[1].set_title("Spread Change vs RV")
+axes[1].set_xlabel("bas_change"); axes[1].set_ylabel("rv")
+ 
+axes[2].scatter(eda_sample["spread_vol_interaction"], eda_sample["rv"], alpha=0.1, s=3, color="seagreen")
+axes[2].set_title("Spread × Lagged Vol Interaction vs RV")
+axes[2].set_xlabel("spread_vol_interaction"); axes[2].set_ylabel("rv")
+ 
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/spread_features_eda.png", dpi=150)
+plt.show()
+ 
+
+# 8. COVARIATE SELECTION SUMMARY
+
+print("\n" + "=" * 60)
+print("COVARIATE FINAL SET SUMMARY")
+print("=" * 60)
+ 
+# Compute pairwise correlations with target
+rv_corrs = (
+    eda_sample[all_features + [TARGET]]
+    .dropna()
+    .corr()[TARGET]
+    .drop(TARGET)
+    .sort_values(key=abs, ascending=False)
+)
+print("\nFeature correlations with RV (sorted by |r|):")
+print(rv_corrs.to_string())
+ 
+# Final selected features (highest signal + spread/price/order coverage)
+FINAL_FEATURES = [
+    "rv_lag1",               # strongest persistence signal
+    "rv_lag2",               # secondary lag
+    "rv_roll_mean",          # rolling average (trend)
+    "rv_roll_sd",            # rolling variability
+    "rv_roll_cv",            # coefficient of variation
+    "bas",                   # raw bid-ask spread
+    "rel_spread",            # normalised spread (price-adjusted)
+    "bas_change",            # spread dynamics
+    "bas_roll_mean",         # rolling spread level
+    "wap_return",            # price momentum
+    "wap_dev",               # deviation from rolling price mean
+    "spread_vol_interaction",# spread × lagged vol
+    "rel_spread_vol",        # relative spread × lagged vol
+    "rv_lag1_sq",            # nonlinear persistence
+]
+ 
+print(f"\nFinal feature set ({len(FINAL_FEATURES)} features):")
+for f in FINAL_FEATURES:
+    corr_val = rv_corrs.get(f, np.nan)
+    print(f"  {f:<30} r={corr_val:+.4f}")
+ 
+
+# 9. PREPARE MATRICES
+
+train_clean = train.dropna(subset=FINAL_FEATURES + [TARGET])
+test_clean  = test.dropna(subset=FINAL_FEATURES + [TARGET])
+ 
+X_train     = train_clean[FINAL_FEATURES].values
+y_train     = train_clean[TARGET].values
+X_test      = test_clean[FINAL_FEATURES].values
+y_test      = test_clean[TARGET].values
 bucket_vals = train_clean["time_bucket"].values
+ 
+print(f"\nClean train rows: {len(train_clean):,} | Clean test rows: {len(test_clean):,}")
+ 
 
-# 8. OLS baseline
-print("Fitting OLS baseline...")
-ols = LinearRegression().fit(X_train, y_train)
+# 10. LOSS FUNCTIONS
 
-# 9. QLIKE loss
 def qlike(y, yhat):
+    """QLIKE loss — standard volatility forecasting criterion."""
     yhat = np.maximum(yhat, 1e-8)
     return np.mean(np.log(yhat) + y / yhat)
+ 
+def mse(y, yhat):
+    return np.mean((y - yhat) ** 2)
+ 
+def mae(y, yhat):
+    return np.mean(np.abs(y - yhat))
+ 
 
-# 10. Alpha tuning via parallel grid search
-print("Tuning alpha...")
-alpha_grid = np.arange(0.1, 1.00, 0.01)
+# 11. OLS BASELINE
 
+print("\n" + "=" * 60)
+print("OLS BASELINE")
+print("=" * 60)
+ols = LinearRegression().fit(X_train, y_train)
+ols_pred = np.maximum(ols.predict(X_test), 1e-8)
+print(f"OLS MSE:   {mse(y_test, ols_pred):.8f}")
+print(f"OLS MAE:   {mae(y_test, ols_pred):.8f}")
+print(f"OLS QLIKE: {qlike(y_test, ols_pred):.6f}")
+ 
+# OLS coefficients
+coef_df = pd.DataFrame({
+    "feature":     FINAL_FEATURES,
+    "coefficient": ols.coef_,
+    "abs_coef":    np.abs(ols.coef_)
+}).sort_values("abs_coef", ascending=False)
+print("\nOLS Coefficients (sorted by |coef|):")
+print(coef_df.drop("abs_coef", axis=1).to_string(index=False))
+ 
+
+# 12. ALPHA TUNING — PARALLEL GRID SEARCH
+
+print("\n" + "=" * 60)
+print("ALPHA TUNING (WLS decay parameter)")
+print("=" * 60)
+ 
+alpha_grid = np.round(np.arange(0.05, 1.00, 0.01), 3)
+ 
 def fit_alpha(a, X_train, y_train, X_test, y_test, n_train, bucket_vals):
     weights = a ** (n_train - bucket_vals)
-    wls = LinearRegression().fit(X_train, y_train, sample_weight=weights)
-    preds = np.maximum(wls.predict(X_test), 1e-8)
-    return {"alpha": a, "qlike": qlike(y_test, preds)}
-
-tune_results = Parallel(n_jobs=-1)(
+    wls     = LinearRegression().fit(X_train, y_train, sample_weight=weights)
+    preds   = np.maximum(wls.predict(X_test), 1e-8)
+    return {
+        "alpha": a,
+        "qlike": qlike(y_test, preds),
+        "mse":   mse(y_test, preds),
+        "mae":   mae(y_test, preds),
+    }
+ 
+tune_results = Parallel(n_jobs=-1, verbose=0)(
     delayed(fit_alpha)(a, X_train, y_train, X_test, y_test, n_train, bucket_vals)
     for a in alpha_grid
 )
-
-tune_df = pd.DataFrame(tune_results)
-best_row = tune_df.loc[tune_df["qlike"].idxmin()]
+tune_df    = pd.DataFrame(tune_results)
+best_row   = tune_df.loc[tune_df["qlike"].idxmin()]
 best_alpha = best_row["alpha"]
 print(f"Best alpha: {best_alpha:.2f}  |  Validation QLIKE: {best_row['qlike']:.6f}")
+ 
+# Alpha tuning plot
+fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+fig.suptitle("Alpha Tuning: WLS Decay Parameter Grid Search", fontsize=14, fontweight="bold")
+ 
+for ax, metric in zip(axes, ["qlike", "mse", "mae"]):
+    ax.plot(tune_df["alpha"], tune_df[metric], color="steelblue", linewidth=1.5)
+    best_val = tune_df.loc[tune_df["qlike"].idxmin(), metric]
+    ax.axvline(best_alpha, color="red", linestyle="--", linewidth=1.2,
+               label=f"Best α={best_alpha:.2f} ({metric.upper()}={best_val:.6f})")
+    ax.set_title(f"{metric.upper()} vs Alpha")
+    ax.set_xlabel("Alpha"); ax.set_ylabel(metric.upper())
+    ax.legend(fontsize=8)
+ 
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/alpha_tuning.png", dpi=150)
+plt.show()
+ 
 
-# Plot tuning curve
-plt.figure(figsize=(8, 4))
-plt.plot(tune_df["alpha"], tune_df["qlike"], color="steelblue")
-plt.axvline(best_alpha, color="red", linestyle="--", label=f"Best α = {best_alpha:.2f}")
-plt.title("Alpha Tuning: QLIKE vs Decay Parameter")
-plt.xlabel("Alpha"); plt.ylabel("Validation QLIKE")
-plt.legend(); plt.tight_layout(); plt.show()
+# 13. FINAL WLS MODEL
 
-# 11. Final WLS model with best alpha
-print("Fitting final WLS model...")
+print("\n" + "=" * 60)
+print("FINAL WLS MODEL")
+print("=" * 60)
 best_weights = best_alpha ** (n_train - bucket_vals)
 wls = LinearRegression().fit(X_train, y_train, sample_weight=best_weights)
-
-# 12. Evaluation
-ols_pred = np.maximum(ols.predict(X_test), 1e-8)
 wls_pred = np.maximum(wls.predict(X_test), 1e-8)
+ 
+# WLS coefficients
+wls_coef_df = pd.DataFrame({
+    "feature":         FINAL_FEATURES,
+    "ols_coefficient": ols.coef_,
+    "wls_coefficient": wls.coef_,
+    "delta":           wls.coef_ - ols.coef_,
+}).sort_values("wls_coefficient", key=abs, ascending=False)
+print("\nOLS vs WLS Coefficients:")
+print(wls_coef_df.to_string(index=False))
+ 
 
-mse_ols = np.mean((y_test - ols_pred) ** 2)
-mse_wls = np.mean((y_test - wls_pred) ** 2)
-qlike_ols = qlike(y_test, ols_pred)
-qlike_wls = qlike(y_test, wls_pred)
+# 14. EVALUATION: OLS vs WLS
 
-print(f"\n--- Results ---")
-print(f"OLS MSE: {mse_ols:.8f}")
-print(f"WLS MSE: {mse_wls:.8f}")
-print(f"OLS QLIKE: {qlike_ols:.6f}")
-print(f"WLS QLIKE: {qlike_wls:.6f}")
+print("\n" + "=" * 60)
+print("MODEL COMPARISON: OLS vs WLS")
+print("=" * 60)
+ 
+results = pd.DataFrame({
+    "Model":   ["OLS", f"WLS (α={best_alpha:.2f})"],
+    "MSE":     [mse(y_test, ols_pred),   mse(y_test, wls_pred)],
+    "MAE":     [mae(y_test, ols_pred),   mae(y_test, wls_pred)],
+    "QLIKE":   [qlike(y_test, ols_pred), qlike(y_test, wls_pred)],
+})
+print(results.to_string(index=False))
+ 
+# Improvement
+for metric in ["MSE", "MAE", "QLIKE"]:
+    ols_val = results.loc[results["Model"] == "OLS", metric].values[0]
+    wls_val = results.loc[results["Model"] != "OLS", metric].values[0]
+    pct     = (ols_val - wls_val) / ols_val * 100
+    print(f"{metric} improvement (WLS over OLS): {pct:+.3f}%")
+ 
+
+# 15. DIAGNOSTIC PLOTS: OLS vs WLS
+
+plot_sample_idx = np.random.choice(len(y_test), min(10_000, len(y_test)), replace=False)
+y_sample     = y_test[plot_sample_idx]
+ols_sample   = ols_pred[plot_sample_idx]
+wls_sample   = wls_pred[plot_sample_idx]
+ 
+fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+fig.suptitle("OLS vs WLS — Diagnostic Plots", fontsize=16, fontweight="bold")
+ 
+# Predicted vs Actual
+for ax, pred, label, color in zip(
+    [axes[0, 0], axes[0, 1]],
+    [ols_sample, wls_sample],
+    ["OLS", f"WLS (α={best_alpha:.2f})"],
+    ["steelblue", "coral"]
+):
+    ax.scatter(y_sample, pred, alpha=0.15, s=3, color=color)
+    lim = max(y_sample.max(), pred.max())
+    ax.plot([0, lim], [0, lim], "k--", linewidth=1, label="Perfect forecast")
+    ax.set_title(f"{label}: Predicted vs Actual RV")
+    ax.set_xlabel("Actual RV"); ax.set_ylabel("Predicted RV")
+    ax.legend(fontsize=8)
+ 
+# Residuals
+ols_resid = y_sample - ols_sample
+wls_resid = y_sample - wls_sample
+for ax, resid, label, color in zip(
+    [axes[1, 0], axes[1, 1]],
+    [ols_resid, wls_resid],
+    ["OLS", f"WLS (α={best_alpha:.2f})"],
+    ["steelblue", "coral"]
+):
+    ax.hist(resid, bins=80, color=color, alpha=0.7, edgecolor="none")
+    ax.axvline(0, color="black", linestyle="--")
+    ax.set_title(f"{label}: Residual Distribution")
+    ax.set_xlabel("Residual"); ax.set_ylabel("Count")
+ 
+# Coefficient comparison bar chart
+ax = axes[0, 2]
+x = np.arange(len(FINAL_FEATURES))
+width = 0.35
+ax.barh(x - width/2, wls_coef_df["ols_coefficient"].values, height=width, label="OLS", color="steelblue", alpha=0.8)
+ax.barh(x + width/2, wls_coef_df["wls_coefficient"].values, height=width, label="WLS", color="coral", alpha=0.8)
+ax.set_yticks(x)
+ax.set_yticklabels(wls_coef_df["feature"].values, fontsize=7)
+ax.axvline(0, color="black", linewidth=0.8)
+ax.set_title("OLS vs WLS Coefficients")
+ax.set_xlabel("Coefficient value")
+ax.legend()
+ 
+# QLIKE by time bucket (out-of-sample)
+ax = axes[1, 2]
+test_eval = test_clean.copy()
+test_eval["ols_pred"] = ols_pred
+test_eval["wls_pred"] = wls_pred
+bucket_perf = test_eval.groupby("time_bucket").apply(
+    lambda g: pd.Series({
+        "ols_qlike": qlike(g[TARGET].values, g["ols_pred"].values),
+        "wls_qlike": qlike(g[TARGET].values, g["wls_pred"].values),
+    })
+).reset_index()
+ax.plot(bucket_perf["time_bucket"], bucket_perf["ols_qlike"], label="OLS", color="steelblue", marker="o")
+ax.plot(bucket_perf["time_bucket"], bucket_perf["wls_qlike"], label=f"WLS (α={best_alpha:.2f})", color="coral", marker="s")
+ax.set_title("QLIKE per Time Bucket (Val set)")
+ax.set_xlabel("time_bucket"); ax.set_ylabel("QLIKE")
+ax.legend()
+ 
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/ols_vs_wls_diagnostics.png", dpi=150)
+plt.show()
+ 
+
+# 16. FINAL SUMMARY
+
+print("\n" + "=" * 60)
+print("FINAL SUMMARY")
+print("=" * 60)
+print(results.to_string(index=False))
+print(f"\nBest WLS decay parameter α = {best_alpha:.2f}")
+print(f"Features used: {len(FINAL_FEATURES)}")
+print("\nDone.")
