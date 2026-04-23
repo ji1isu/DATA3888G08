@@ -1,6 +1,5 @@
-"""
 Member 2: WLS Volatility Forecasting Pipeline
-=================================================================
+
 Source data : optiver_aggregated.csv
               (aggregated from individual_book_train/*.csv)
               Columns: stock_id, time_id, time_bucket,
@@ -12,7 +11,6 @@ Source data : optiver_aggregated.csv
 
 
 Trader summary
---------------------------------
   "Standard regression (OLS) treats every data point equally, whether
    it came from 10 minutes ago or 10 months ago.  For fast-moving
    markets this is a problem — old market conditions can dilute the
@@ -25,8 +23,8 @@ Trader summary
    quickly the market forgets its past.  The result: recent 30-second
    windows count for more, older ones count for less — exactly what a
    trader wants when conditions can shift within a single session."
-"""
 
+# ─────────────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -39,9 +37,7 @@ from joblib import Parallel, delayed
 import warnings
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────
-# PALETTE  (consistent across all figures)
-# ─────────────────────────────────────────────────────────────────────
+# Colours
 C_BLUE   = "#1F4E79"
 C_ORANGE = "#C55A11"
 C_GREEN  = "#375623"
