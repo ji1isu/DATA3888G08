@@ -1,531 +1,1023 @@
+"""
+Member 2: WLS Volatility Forecasting Pipeline
+=================================================================
+Source data : optiver_aggregated.csv
+              (aggregated from individual_book_train/*.csv)
+              Columns: stock_id, time_id, time_bucket,
+                       WAP_mean, BidAskSpread_mean, volatility
+
+30-second buckets : CEIL(seconds_in_bucket / 30) → buckets 1–20
+                    Each bucket represents exactly 30 seconds of a
+                    600-second auction window.
+
+
+Trader summary
+--------------------------------
+  "Standard regression (OLS) treats every data point equally, whether
+   it came from 10 minutes ago or 10 months ago.  For fast-moving
+   markets this is a problem — old market conditions can dilute the
+   signal from today's trading.  WLS fixes this by assigning an
+   exponentially decaying weight:  w = α^(T − t),  where t is the
+   bucket index and T is the last training bucket.  When α is close to
+   1 the decay is gentle; when α is small, only very recent buckets
+   matter.  We grid-search α on validation QLIKE (the standard
+   volatility-forecast loss) so the model automatically learns how
+   quickly the market forgets its past.  The result: recent 30-second
+   windows count for more, older ones count for less — exactly what a
+   trader wants when conditions can shift within a single session."
+"""
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error
 from joblib import Parallel, delayed
 import warnings
 warnings.filterwarnings("ignore")
- 
-# ─────────────────────────────────────────────
-# 1. LOAD DATA
-# ─────────────────────────────────────────────
-print("=" * 60)
-print("LOADING DATA")
-print("=" * 60)
-df = pd.read_csv("/Users/jamiewood/Documents/DATA3888/DATA3888G08/optiver_aggregated.csv")
-print(f"Shape: {df.shape}")
-print(df.head())
- 
-# ─────────────────────────────────────────────
-# 2. RENAME COLUMNS
-# ─────────────────────────────────────────────
-df = df.rename(columns={
-    "WAP_mean":          "wap",
-    "BidAskSpread_mean": "bas",
-    "volatility":        "rv"
+
+# ─────────────────────────────────────────────────────────────────────
+# PALETTE  (consistent across all figures)
+# ─────────────────────────────────────────────────────────────────────
+C_BLUE   = "#1F4E79"
+C_ORANGE = "#C55A11"
+C_GREEN  = "#375623"
+C_PURPLE = "#7030A0"
+C_GOLD   = "#BF8F00"
+C_GREY   = "#595959"
+C_LGREY  = "#D9D9D9"
+C_BG     = "#F7F9FC"
+
+plt.rcParams.update({
+    "figure.facecolor":  C_BG,
+    "axes.facecolor":    C_BG,
+    "axes.edgecolor":    C_GREY,
+    "axes.labelcolor":   C_GREY,
+    "xtick.color":       C_GREY,
+    "ytick.color":       C_GREY,
+    "text.color":        C_GREY,
+    "font.family":       "DejaVu Sans",
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.grid":         True,
+    "grid.alpha":        0.3,
+    "grid.color":        C_LGREY,
 })
- 
-# ─────────────────────────────────────────────
-# 3. SORT
-# ─────────────────────────────────────────────
+
+OUT = "/Users/jamiewood/Documents/DATA3888/DATA3888G08/"
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 1 — LOAD & VALIDATE
+# ═════════════════════════════════════════════════════════════════════
+print("=" * 70)
+print("SECTION 1 — LOAD & VALIDATE DATA")
+print("=" * 70)
+
+df = pd.read_csv(OUT + "optiver_aggregated.csv")
+print(f"Shape : {df.shape}")
+print(df.head())
+
+# ── 30-second bucket contract ────────────────────────────────────────
+#
+#   The aggregation step used:
+#       time_bucket = CEIL(seconds_in_bucket / 30)
+#
+#   CEIL(0 / 30) = 0  →  rows where seconds_in_bucket = 0 land in
+#   bucket 0.  These are opening-snapshot rows with log_return = 0
+#   (no prior price to diff against).  Buckets 1–20 each represent a
+#   genuine 30-second trading interval.
+#
+#   We drop bucket 0 here so every retained row has a meaningful RV,
+#   leaving exactly 20 buckets (1 … 20) = 600 seconds total.
+#
+BUCKET_SECONDS     = 30
+WINDOW_SECONDS     = 600
+N_EXPECTED_BUCKETS = WINDOW_SECONDS // BUCKET_SECONDS   # 20
+
+observed_raw = df["time_bucket"].nunique()
+bmin, bmax   = int(df["time_bucket"].min()), int(df["time_bucket"].max())
+print(f"\n[BUCKET CHECK]  raw unique={observed_raw}  min={bmin}  max={bmax}")
+
+if bmin == 0:
+    n_dropped = int((df["time_bucket"] == 0).sum())
+    df = df[df["time_bucket"] > 0].copy()
+    print(f"[BUCKET CHECK]  dropped {n_dropped:,} bucket-0 rows "
+          f"(CEIL(0/30)=0, opening snapshot, RV=0 by construction)")
+
+observed = df["time_bucket"].nunique()
+print(f"[BUCKET CHECK]  retained unique={observed}  "
+      f"min={int(df['time_bucket'].min())}  max={int(df['time_bucket'].max())}")
+print(f"[BUCKET CHECK]  expected {N_EXPECTED_BUCKETS} buckets of {BUCKET_SECONDS}s each")
+assert observed == N_EXPECTED_BUCKETS, (
+    f"Expected {N_EXPECTED_BUCKETS} buckets after dropping bucket 0, got {observed}."
+)
+print("[BUCKET CHECK]  ✓  confirmed — buckets 1–20, each = 30 seconds\n")
+
+# ── Rename ────────────────────────────────────────────────────────────
+df = df.rename(columns={
+    "WAP_mean":           "wap",
+    "BidAskSpread_mean":  "bas",
+    "volatility":         "rv",
+})
 df = df.sort_values(["stock_id", "time_id", "time_bucket"]).reset_index(drop=True)
- 
-# ─────────────────────────────────────────────
-# 4. TRAIN / VAL SPLIT (80/20 on time_bucket)
-# ─────────────────────────────────────────────
-n_buckets = df["time_bucket"].max() + 1
-n_train   = int(n_buckets * 0.8)
-n_val     = n_buckets - n_train
-print(f"\nTotal buckets: {n_buckets} | Train: {n_train} | Val: {n_val}")
- 
-train = df[df["time_bucket"] <  n_train].copy()
-test  = df[df["time_bucket"] >= n_train].copy()
-print(f"Train rows: {len(train):,} | Test rows: {len(test):,}")
- 
-# ─────────────────────────────────────────────
-# 5. FEATURE ENGINEERING
-#    Includes: lags, rolling stats, spread features,
-#    price momentum, order-flow proxies, interactions
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("FEATURE ENGINEERING")
-print("=" * 60)
- 
-def add_features(df):
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 2 — TRAIN / VAL SPLIT  (80 / 20 on time_bucket)
+# ═════════════════════════════════════════════════════════════════════
+print("=" * 70)
+print("SECTION 2 — TRAIN / VAL SPLIT")
+print("=" * 70)
+
+n_buckets = df["time_bucket"].nunique()              # 20  (buckets 1–20)
+n_train   = int(n_buckets * 0.8)                     # 16 → 480 s
+n_val     = n_buckets - n_train                      #  4 → 120 s
+# Work with sorted bucket labels so split is label-safe
+sorted_buckets    = sorted(df["time_bucket"].unique())
+train_max_bucket  = sorted_buckets[n_train - 1]      # label of last train bucket
+
+print(f"  Total buckets : {n_buckets}  ({n_buckets * BUCKET_SECONDS}s)")
+print(f"  Train buckets : {n_train}    (buckets 1–{train_max_bucket}, {n_train*BUCKET_SECONDS}s)")
+print(f"  Val   buckets : {n_val}      (buckets {train_max_bucket+1}–20, {n_val*BUCKET_SECONDS}s)")
+
+train = df[df["time_bucket"] <= train_max_bucket].copy()
+test  = df[df["time_bucket"] >  train_max_bucket].copy()
+print(f"  Train rows : {len(train):,}   Val rows : {len(test):,}")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 3 — FEATURE ENGINEERING
+#   Covariate groups:
+#     (A) RV lags / rolling          — volatility persistence
+#     (B) Bid-ask spread             — liquidity / information asymmetry
+#     (C) Price (WAP)                — momentum / mean-reversion
+#     (D) Order-flow proxies         — derived from bid/ask sizes via WAP
+#     (E) Interaction terms          — spread × vol, etc.
+#     (F) Nonlinear terms            — squared lags
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 3 — FEATURE ENGINEERING  (30-second buckets)")
+print("=" * 70)
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add all covariates grouped by type."""
     df  = df.sort_values(["stock_id", "time_id", "time_bucket"]).copy()
     grp = df.groupby(["stock_id", "time_id"])
- 
-    # ── Lag features ──────────────────────────
-    df["rv_lag1"]  = grp["rv"].shift(1)
-    df["rv_lag2"]  = grp["rv"].shift(2)
-    df["rv_lag3"]  = grp["rv"].shift(3)
-    df["bas_lag1"] = grp["bas"].shift(1)
-    df["wap_lag1"] = grp["wap"].shift(1)
-    df["wap_lag2"] = grp["wap"].shift(2)
- 
-    # ── Rolling features (window = 5) ─────────
-    df["rv_roll_mean"]  = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    df["rv_roll_sd"]    = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).std())
-    df["rv_roll_max"]   = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).max())
-    df["bas_roll_mean"] = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    df["bas_roll_sd"]   = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).std())
+
+    # ── A. RV lags & rolling ─────────────────────────────────────────
+    df["rv_lag1"]      = grp["rv"].shift(1)
+    df["rv_lag2"]      = grp["rv"].shift(2)
+    df["rv_lag3"]      = grp["rv"].shift(3)
+    df["rv_roll_mean"] = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df["rv_roll_sd"]   = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).std())
+    df["rv_roll_max"]  = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).max())
+    # Coefficient of variation = SD / mean  (relative dispersion of recent vol)
+    df["rv_roll_cv"]   = df["rv_roll_sd"] / (df["rv_roll_mean"] + 1e-12)
+
+    # ── B. Bid-ask spread covariates ─────────────────────────────────
+    df["bas_lag1"]       = grp["bas"].shift(1)
+    # Relative spread = BAS / WAP  (price-normalised liquidity cost)
+    df["rel_spread"]     = df["bas"] / (df["wap"] + 1e-12)
+    df["rel_spread_lag1"]= grp["rel_spread"].shift(1)
+    # Spread dynamics
+    df["bas_change"]     = df["bas"] - df["bas_lag1"]
+    df["bas_pct_change"] = df["bas_change"] / (df["bas_lag1"] + 1e-12)
+    df["bas_roll_mean"]  = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df["bas_roll_sd"]    = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).std())
+    df["bas_sq"]         = df["bas"] ** 2   # nonlinear spread term
+
+    # ── C. Price covariates ──────────────────────────────────────────
+    df["wap_lag1"]      = grp["wap"].shift(1)
+    df["wap_lag2"]      = grp["wap"].shift(2)
+    # Log return between consecutive 30-second buckets
+    df["wap_return"]    = np.log(df["wap"] / (df["wap_lag1"] + 1e-12))
+    df["wap_return2"]   = np.log(df["wap"] / (df["wap_lag2"] + 1e-12))
     df["wap_roll_mean"] = grp["wap"].transform(lambda x: x.rolling(5, min_periods=1).mean())
- 
-    # ── Spread features ───────────────────────
-    # Relative spread (normalised by WAP)
-    df["rel_spread"]      = df["bas"] / (df["wap"] + 1e-12)
-    df["rel_spread_lag1"] = grp["rel_spread"].shift(1)
-    # Spread change
-    df["bas_change"]      = df["bas"] - df["bas_lag1"]
-    df["bas_pct_change"]  = df["bas_change"] / (df["bas_lag1"] + 1e-12)
- 
-    # ── Price / order features ────────────────
-    # WAP return (log)
-    df["wap_return"]      = np.log(df["wap"] / (df["wap_lag1"] + 1e-12))
-    df["wap_return2"]     = np.log(df["wap"] / (df["wap_lag2"] + 1e-12))
-    # WAP deviation from rolling mean (mean-reversion signal)
-    df["wap_dev"]         = df["wap"] - df["wap_roll_mean"]
-    # Price acceleration
-    df["wap_accel"]       = df["wap_return"] - grp["wap_return"].shift(1)
- 
-    # ── Interaction terms ─────────────────────
-    df["spread_vol_interaction"]  = df["bas"]        * df["rv_lag1"]
-    df["wap_vol_interaction"]     = df["wap_return"]  * df["rv_lag1"]
-    df["rel_spread_vol"]          = df["rel_spread"]  * df["rv_lag1"]
-    df["spread_change_vol"]       = df["bas_change"]  * df["rv_lag1"]
- 
-    # ── Squared / nonlinear terms ─────────────
+    # Mean-reversion signal: how far price is from its recent average
+    df["wap_dev"]       = df["wap"] - df["wap_roll_mean"]
+    # Price acceleration = change in log-return between consecutive buckets
+    df["wap_accel"]     = df["wap_return"] - grp["wap_return"].shift(1)
+
+    # ── D. Order-flow proxies ────────────────────────────────────────
+    #   The aggregated file contains only WAP and BAS; we derive
+    #   order-flow signals from the spread and its dynamics because
+    #   raw bid/ask sizes are not available post-aggregation.
+    #
+    #   num_orders proxy  : inverse of spread (tight spread → many orders)
+    df["inv_spread"]        = 1.0 / (df["bas"] + 1e-6)
+    df["inv_spread_lag1"]   = grp["inv_spread"].shift(1)
+    df["inv_spread_roll"]   = grp["inv_spread"].transform(
+                                  lambda x: x.rolling(5, min_periods=1).mean())
+    #
+    #   volume proxy        : WAP × inv_spread  (activity proxy)
+    df["activity_proxy"]    = df["wap"] * df["inv_spread"]
+    df["log_activity"]      = np.log1p(df["activity_proxy"])
+    df["log_activity_lag1"] = grp["log_activity"].shift(1)
+    #
+    #   order-imbalance proxy: signed spread change normalised by level
+    #   (positive = ask-side widening → sell pressure)
+    df["spread_imbalance"]  = df["bas_pct_change"]
+    df["volume_surge"]      = df["inv_spread"] / (df["inv_spread_roll"] + 1e-12)
+
+    # ── E. Interaction terms ─────────────────────────────────────────
+    df["spread_vol_interaction"] = df["bas"]         * df["rv_lag1"]
+    df["rel_spread_vol"]         = df["rel_spread"]  * df["rv_lag1"]
+    df["spread_change_vol"]      = df["bas_change"]  * df["rv_lag1"]
+    df["activity_vol"]           = df["log_activity"]* df["rv_lag1"]
+    df["wap_vol_interaction"]    = df["wap_return"]  * df["rv_lag1"]
+
+    # ── F. Nonlinear terms ───────────────────────────────────────────
     df["rv_lag1_sq"]  = df["rv_lag1"] ** 2
     df["bas_sq"]      = df["bas"] ** 2
-    df["rv_roll_cv"]  = df["rv_roll_sd"] / (df["rv_roll_mean"] + 1e-12)   # coefficient of variation
- 
+
     return df
- 
-print("Engineering train features...")
+
+print("Engineering train features …")
 train = add_features(train)
-print("Engineering test features...")
+print("Engineering val   features …")
 test  = add_features(test)
- 
-all_features = [
-    # Core lags
+
+# ── Candidate feature list for EDA ───────────────────────────────────
+ALL_FEATURES = [
+    # RV lags/rolling
     "rv_lag1", "rv_lag2", "rv_lag3",
-    "bas_lag1", "wap_lag1",
-    # Rolling
     "rv_roll_mean", "rv_roll_sd", "rv_roll_max", "rv_roll_cv",
-    "bas_roll_mean", "bas_roll_sd",
-    # Spread
-    "bas", "rel_spread", "rel_spread_lag1", "bas_change", "bas_pct_change",
-    # Price / order
+    # Bid-ask spread
+    "bas", "bas_lag1", "rel_spread", "rel_spread_lag1",
+    "bas_change", "bas_pct_change", "bas_roll_mean", "bas_roll_sd",
+    # Price
     "wap", "wap_return", "wap_return2", "wap_dev", "wap_accel",
+    # Order-flow proxies
+    "inv_spread", "inv_spread_lag1", "log_activity", "log_activity_lag1",
+    "spread_imbalance", "volume_surge",
     # Interactions
-    "spread_vol_interaction", "wap_vol_interaction",
-    "rel_spread_vol", "spread_change_vol",
+    "spread_vol_interaction", "rel_spread_vol",
+    "spread_change_vol", "activity_vol",
     # Nonlinear
     "rv_lag1_sq", "bas_sq",
 ]
 TARGET = "rv"
- 
-print(f"\nTotal engineered features: {len(all_features)}")
- 
-# ─────────────────────────────────────────────
-# 6. EDA — PARALLEL COMPUTATION
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("EDA")
-print("=" * 60)
- 
-eda_sample = train.sample(50_000, random_state=42)
- 
-# ── Parallel EDA stats per stock ─────────────
+print(f"Candidate features: {len(ALL_FEATURES)}")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 4 — EDA  (parallel per-stock stats)
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 4 — EDA")
+print("=" * 70)
+
+eda_sample = train.sample(min(50_000, len(train)), random_state=42)
+
 def stock_eda_stats(sid, df):
-    sub = df[df["stock_id"] == sid]["rv"].dropna()
+    sub = df[df["stock_id"] == sid]
+    rv  = sub["rv"].dropna()
     return {
-        "stock_id": sid,
-        "rv_mean":  sub.mean(),
-        "rv_std":   sub.std(),
-        "rv_skew":  sub.skew(),
-        "rv_kurt":  sub.kurt(),
-        "rv_q95":   sub.quantile(0.95),
+        "stock_id":    sid,
+        "rv_mean":     rv.mean(),
+        "rv_std":      rv.std(),
+        "rv_skew":     rv.skew(),
+        "rv_kurt":     rv.kurt(),
+        "rv_q95":      rv.quantile(0.95),
+        "bas_mean":    sub["bas"].dropna().mean(),
+        "activity_mean": sub["log_activity"].dropna().mean(),
     }
- 
+
 stock_ids = train["stock_id"].unique()
-print(f"Computing per-stock EDA stats in parallel for {len(stock_ids)} stocks...")
+print(f"Per-stock stats for {len(stock_ids)} stocks (parallel) …")
 stock_stats = Parallel(n_jobs=-1)(
     delayed(stock_eda_stats)(sid, train) for sid in stock_ids
 )
 stock_stats_df = pd.DataFrame(stock_stats).set_index("stock_id")
-print("\nPer-stock RV summary (first 10):")
+print("\nPer-stock summary (first 10):")
 print(stock_stats_df.head(10).to_string())
- 
-# ── Correlation analysis ──────────────────────
-corr_cols = [
-    "rv", "rv_lag1", "rv_lag2",
-    "bas", "rel_spread", "bas_change",
-    "wap_return", "wap_dev",
-    "rv_roll_mean", "rv_roll_sd",
-    "spread_vol_interaction"
-]
-corr_matrix = eda_sample[corr_cols].dropna().corr()
- 
-# ─────────────────────────────────────────────
-# 7. EDA PLOTS
-# ─────────────────────────────────────────────
- 
-# ── Figure 1: Distributions & Scatter ────────
-fig, axes = plt.subplots(2, 3, figsize=(20, 10))
-fig.suptitle("EDA — Distributions & Relationships", fontsize=16, fontweight="bold")
- 
-# RV distribution
-axes[0, 0].hist(train["rv"].dropna(), bins=100, color="steelblue", edgecolor="none")
-axes[0, 0].set_title("Distribution of Realised Volatility")
-axes[0, 0].set_xlabel("rv"); axes[0, 0].set_ylabel("Count")
- 
-# BAS distribution
-axes[0, 1].hist(train["bas"].dropna(), bins=100, color="coral", edgecolor="none")
-axes[0, 1].set_title("Distribution of Bid-Ask Spread")
-axes[0, 1].set_xlabel("bas")
- 
-# Relative spread distribution
-axes[0, 2].hist(eda_sample["rel_spread"].dropna(), bins=80, color="mediumpurple", edgecolor="none")
-axes[0, 2].set_title("Distribution of Relative Spread (bas/WAP)")
-axes[0, 2].set_xlabel("rel_spread")
- 
-# BAS vs RV scatter
-axes[1, 0].scatter(eda_sample["bas"], eda_sample["rv"], alpha=0.1, s=3, color="steelblue")
-axes[1, 0].set_title("Bid-Ask Spread vs RV")
-axes[1, 0].set_xlabel("bas"); axes[1, 0].set_ylabel("rv")
- 
-# WAP return vs RV
-axes[1, 1].scatter(eda_sample["wap_return"], eda_sample["rv"], alpha=0.1, s=3, color="coral")
-axes[1, 1].set_title("WAP Return vs RV")
-axes[1, 1].set_xlabel("wap_return"); axes[1, 1].set_ylabel("rv")
- 
-# RV lag1 vs RV (persistence)
-axes[1, 2].scatter(eda_sample["rv_lag1"], eda_sample["rv"], alpha=0.1, s=3, color="seagreen")
-axes[1, 2].set_title("RV Lag-1 vs RV (Persistence)")
-axes[1, 2].set_xlabel("rv_lag1"); axes[1, 2].set_ylabel("rv")
- 
-plt.tight_layout()
-plt.savefig("/Users/jamiewood/Documents/DATA3888/DATA3888G08/eda_distributions.png", dpi=150)
-plt.show()
- 
-# ── Figure 2: Correlation Heatmap ────────────
-plt.figure(figsize=(12, 10))
-mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
-sns.heatmap(
-    corr_matrix, annot=True, fmt=".2f", cmap="coolwarm",
-    center=0, mask=mask, linewidths=0.5,
-    annot_kws={"size": 9}
-)
-plt.title("Correlation Matrix — Covariate Final Set", fontsize=14, fontweight="bold")
-plt.tight_layout()
-plt.savefig("/Users/jamiewood/Documents/DATA3888/DATA3888G08/correlation_heatmap.png", dpi=150)
-plt.show()
- 
-# ── Figure 3: Volatility clustering + per-stock stats ─
-fig, axes = plt.subplots(1, 2, figsize=(18, 5))
-fig.suptitle("Volatility Clustering & Cross-Stock Dispersion", fontsize=14, fontweight="bold")
- 
-# Time-series example
-sample_stock = train["stock_id"].iloc[0]
-sample_tid   = train[train["stock_id"] == sample_stock]["time_id"].iloc[0]
-sample_ts    = train[(train["stock_id"] == sample_stock) & (train["time_id"] == sample_tid)]
-axes[0].plot(sample_ts["time_bucket"], sample_ts["rv"], color="steelblue", linewidth=1.2)
-axes[0].fill_between(sample_ts["time_bucket"], sample_ts["rv"], alpha=0.2, color="steelblue")
-axes[0].set_title(f"Volatility Clustering (stock={sample_stock}, time_id={sample_tid})")
-axes[0].set_xlabel("time_bucket"); axes[0].set_ylabel("rv")
- 
-# Per-stock RV mean distribution
-axes[1].bar(range(len(stock_stats_df)), stock_stats_df["rv_mean"].sort_values(), color="coral", width=0.8)
-axes[1].set_title("Mean RV per Stock (cross-sectional dispersion)")
-axes[1].set_xlabel("Stock rank"); axes[1].set_ylabel("Mean RV")
- 
-plt.tight_layout()
-plt.savefig("/Users/jamiewood/Documents/DATA3888/DATA3888G08/volatility_clustering.png", dpi=150)
-plt.show()
- 
-# ── Figure 4: Spread features EDA ────────────
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-fig.suptitle("Bid-Ask Spread Feature Analysis", fontsize=14, fontweight="bold")
- 
-axes[0].scatter(eda_sample["rel_spread"], eda_sample["rv"], alpha=0.1, s=3, color="mediumpurple")
-axes[0].set_title("Relative Spread vs RV")
-axes[0].set_xlabel("rel_spread"); axes[0].set_ylabel("rv")
- 
-axes[1].scatter(eda_sample["bas_change"], eda_sample["rv"], alpha=0.1, s=3, color="darkorange")
-axes[1].set_title("Spread Change vs RV")
-axes[1].set_xlabel("bas_change"); axes[1].set_ylabel("rv")
- 
-axes[2].scatter(eda_sample["spread_vol_interaction"], eda_sample["rv"], alpha=0.1, s=3, color="seagreen")
-axes[2].set_title("Spread × Lagged Vol Interaction vs RV")
-axes[2].set_xlabel("spread_vol_interaction"); axes[2].set_ylabel("rv")
- 
-plt.tight_layout()
-plt.savefig("/Users/jamiewood/Documents/DATA3888/DATA3888G08/spread_features_eda.png", dpi=150)
-plt.show()
- 
-# ─────────────────────────────────────────────
-# 8. COVARIATE SELECTION SUMMARY
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("COVARIATE FINAL SET SUMMARY")
-print("=" * 60)
- 
-# Compute pairwise correlations with target
+
+# ── Correlations with target ──────────────────────────────────────────
 rv_corrs = (
-    eda_sample[all_features + [TARGET]]
+    eda_sample[ALL_FEATURES + [TARGET]]
     .dropna()
     .corr()[TARGET]
     .drop(TARGET)
     .sort_values(key=abs, ascending=False)
 )
-print("\nFeature correlations with RV (sorted by |r|):")
-print(rv_corrs.to_string())
- 
-# Final selected features (highest signal + spread/price/order coverage)
-FINAL_FEATURES = [
-    "rv_lag1",               # strongest persistence signal
-    "rv_lag2",               # secondary lag
-    "rv_roll_mean",          # rolling average (trend)
-    "rv_roll_sd",            # rolling variability
-    "rv_roll_cv",            # coefficient of variation
-    "bas",                   # raw bid-ask spread
-    "rel_spread",            # normalised spread (price-adjusted)
-    "bas_change",            # spread dynamics
-    "bas_roll_mean",         # rolling spread level
-    "wap_return",            # price momentum
-    "wap_dev",               # deviation from rolling price mean
-    "spread_vol_interaction",# spread × lagged vol
-    "rel_spread_vol",        # relative spread × lagged vol
-    "rv_lag1_sq",            # nonlinear persistence
+print("\nTop-20 |r| with RV:")
+print(rv_corrs.head(20).to_string())
+
+# ── Correlation matrix (key subset) ──────────────────────────────────
+corr_cols = [
+    "rv", "rv_lag1", "rv_lag2",
+    "bas", "rel_spread", "bas_change",
+    "wap_return", "wap_dev",
+    "rv_roll_mean", "rv_roll_sd",
+    "log_activity", "inv_spread",
+    "spread_vol_interaction",
 ]
- 
-print(f"\nFinal feature set ({len(FINAL_FEATURES)} features):")
+corr_matrix = eda_sample[corr_cols].dropna().corr()
+
+# ─────────────────────────────────────────────────────────────────────
+# EDA PLOT 1 — Distributions
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    "EDA — Covariate Distributions  (30-second time buckets)",
+    fontsize=14, fontweight="bold", color=C_BLUE, y=1.01
+)
+
+axes[0, 0].hist(train["rv"].dropna(), bins=100, color=C_BLUE, edgecolor="none", alpha=0.85)
+axes[0, 0].set_title("Realised Volatility  [TARGET]")
+axes[0, 0].set_xlabel("rv"); axes[0, 0].set_ylabel("Count")
+
+axes[0, 1].hist(train["bas"].dropna(), bins=100, color=C_ORANGE, edgecolor="none", alpha=0.85)
+axes[0, 1].set_title("Bid-Ask Spread  [SPREAD COVARIATE]")
+axes[0, 1].set_xlabel("bas")
+
+axes[0, 2].hist(eda_sample["rel_spread"].dropna(), bins=80, color=C_PURPLE, edgecolor="none", alpha=0.85)
+axes[0, 2].set_title("Relative Spread = BAS / WAP  [NORMALISED SPREAD]")
+axes[0, 2].set_xlabel("rel_spread")
+
+axes[1, 0].hist(eda_sample["log_activity"].dropna(), bins=100, color=C_GREEN, edgecolor="none", alpha=0.85)
+axes[1, 0].set_title("log(Activity Proxy)  [ORDER-FLOW COVARIATE]")
+axes[1, 0].set_xlabel("log_activity")
+
+axes[1, 1].hist(eda_sample["inv_spread"].dropna(), bins=80, color=C_GOLD, edgecolor="none", alpha=0.85)
+axes[1, 1].set_title("Inverse Spread  [NUM-ORDERS PROXY]")
+axes[1, 1].set_xlabel("inv_spread")
+
+axes[1, 2].scatter(eda_sample["rv_lag1"], eda_sample["rv"],
+                   alpha=0.1, s=3, color=C_BLUE)
+axes[1, 2].set_title("RV Lag-1 vs RV  (persistence / autocorrelation)")
+axes[1, 2].set_xlabel("rv_lag1"); axes[1, 2].set_ylabel("rv")
+
+plt.tight_layout()
+plt.savefig(OUT + "eda_distributions.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: eda_distributions.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# EDA PLOT 2 — Feature selection: |r| with RV, colour-coded by group
+# ─────────────────────────────────────────────────────────────────────
+def feature_group_color(feat):
+    if "rv" in feat and "spread" not in feat and "activity" not in feat:
+        return C_BLUE
+    if feat in ("bas", "bas_lag1", "rel_spread", "rel_spread_lag1",
+                "bas_change", "bas_pct_change", "bas_roll_mean",
+                "bas_roll_sd", "bas_sq"):
+        return C_ORANGE
+    if "activity" in feat or "inv_spread" in feat or "imbalance" in feat \
+            or "volume_surge" in feat:
+        return C_GREEN
+    if "wap" in feat:
+        return C_GOLD
+    return C_GREY
+
+top_n = 22
+rv_corrs_top = rv_corrs.head(top_n)
+bar_colors   = [feature_group_color(f) for f in rv_corrs_top.index]
+
+fig, ax = plt.subplots(figsize=(14, 8))
+fig.patch.set_facecolor(C_BG)
+ax.set_facecolor(C_BG)
+ax.barh(range(top_n), rv_corrs_top.values.astype(float),
+        color=bar_colors, alpha=0.85, edgecolor="none")
+ax.set_yticks(range(top_n))
+ax.set_yticklabels(rv_corrs_top.index, fontsize=9)
+ax.invert_yaxis()
+ax.axvline(0, color=C_GREY, linewidth=0.8)
+ax.set_xlabel("Pearson r with Realised Volatility", fontsize=10)
+ax.set_title(
+    "Feature Selection — Correlation with RV\n"
+    "Covariate Final Set Justification  (Price · Spread · Order-Flow · RV lags)",
+    fontsize=12, fontweight="bold", color=C_BLUE
+)
+legend_items = [
+    mpatches.Patch(color=C_BLUE,   label="RV lags / rolling"),
+    mpatches.Patch(color=C_ORANGE, label="Bid-Ask Spread"),
+    mpatches.Patch(color=C_GREEN,  label="Order-flow proxies"),
+    mpatches.Patch(color=C_GOLD,   label="Price (WAP)"),
+    mpatches.Patch(color=C_GREY,   label="Interaction / nonlinear"),
+]
+ax.legend(handles=legend_items, loc="lower right", fontsize=9)
+plt.tight_layout()
+plt.savefig(OUT + "feature_selection_correlation.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: feature_selection_correlation.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# EDA PLOT 3 — Correlation heatmap
+# ─────────────────────────────────────────────────────────────────────
+plt.figure(figsize=(14, 12))
+plt.gca().set_facecolor(C_BG)
+mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+sns.heatmap(
+    corr_matrix, annot=True, fmt=".2f",
+    cmap=sns.diverging_palette(220, 20, as_cmap=True),
+    center=0, mask=mask, linewidths=0.4,
+    annot_kws={"size": 8}
+)
+plt.title(
+    "Correlation Matrix — Candidate Covariates\n"
+    "(Price  ·  Bid-Ask Spread  ·  Order-Flow  ·  RV Lags)",
+    fontsize=12, fontweight="bold", color=C_BLUE
+)
+plt.tight_layout()
+plt.savefig(OUT + "correlation_heatmap.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: correlation_heatmap.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# EDA PLOT 4 — Bid-ask spread feature analysis
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle("Bid-Ask Spread Covariate Analysis  (30-sec buckets)",
+             fontsize=13, fontweight="bold", color=C_BLUE)
+
+axes[0].scatter(eda_sample["rel_spread"], eda_sample["rv"],
+                alpha=0.1, s=3, color=C_PURPLE)
+axes[0].set_title("Relative Spread vs RV"); axes[0].set_xlabel("rel_spread"); axes[0].set_ylabel("rv")
+
+axes[1].scatter(eda_sample["bas_change"], eda_sample["rv"],
+                alpha=0.1, s=3, color=C_ORANGE)
+axes[1].set_title("Spread Change vs RV"); axes[1].set_xlabel("bas_change"); axes[1].set_ylabel("rv")
+
+axes[2].scatter(eda_sample["spread_vol_interaction"], eda_sample["rv"],
+                alpha=0.1, s=3, color=C_GREEN)
+axes[2].set_title("Spread × Lagged Vol vs RV"); axes[2].set_xlabel("spread_vol_interaction"); axes[2].set_ylabel("rv")
+
+plt.tight_layout()
+plt.savefig(OUT + "spread_features_eda.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: spread_features_eda.png")
+
+# ─────────────────────────────────────────────────────────────────────
+# EDA PLOT 5 — Order-flow proxy & volume analysis
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle("Order-Flow Proxy & Activity Analysis  (30-sec buckets)",
+             fontsize=13, fontweight="bold", color=C_BLUE)
+
+axes[0].scatter(eda_sample["inv_spread"], eda_sample["rv"],
+                alpha=0.1, s=3, color=C_PURPLE)
+axes[0].set_title("Inv Spread (order proxy) vs RV"); axes[0].set_xlabel("inv_spread"); axes[0].set_ylabel("rv")
+
+axes[1].scatter(eda_sample["log_activity"], eda_sample["rv"],
+                alpha=0.1, s=3, color=C_GREEN)
+axes[1].set_title("log(Activity Proxy) vs RV"); axes[1].set_xlabel("log_activity"); axes[1].set_ylabel("rv")
+
+axes[2].scatter(eda_sample["volume_surge"], eda_sample["rv"],
+                alpha=0.1, s=3, color=C_GOLD)
+axes[2].set_title("Volume Surge Ratio vs RV"); axes[2].set_xlabel("volume_surge"); axes[2].set_ylabel("rv")
+
+plt.tight_layout()
+plt.savefig(OUT + "order_flow_features_eda.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: order_flow_features_eda.png")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 5 — VOLATILITY CLUSTERING & MARKET REGIMES  → cluster_plots.png
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 5 — VOLATILITY CLUSTERING & MARKET REGIMES  →  cluster_plots.png")
+print("=" * 70)
+
+# Three regimes based on global RV quantiles
+q33 = train["rv"].quantile(0.33)
+q66 = train["rv"].quantile(0.66)
+print(f"  Regime thresholds:  Low < {q33:.6f}  ≤  Med < {q66:.6f}  ≤  High")
+
+def classify_regime(v):
+    if v <= q33: return 0
+    if v <= q66: return 1
+    return 2
+
+train["regime"] = train["rv"].apply(classify_regime)
+test["regime"]  = test["rv"].apply(classify_regime)
+
+REG_COLORS = {0: C_GREEN, 1: C_GOLD, 2: C_ORANGE}
+REG_LABELS = {0: "Low Vol", 1: "Med Vol", 2: "High Vol"}
+
+# Pick illustrative stock × time_id
+sample_stock = train["stock_id"].value_counts().idxmax()
+sample_tids  = train[train["stock_id"] == sample_stock]["time_id"].unique()
+sample_tid   = sample_tids[len(sample_tids) // 2]
+sample_ts    = train[
+    (train["stock_id"] == sample_stock) &
+    (train["time_id"]  == sample_tid)
+].copy().sort_values("time_bucket")
+
+fig = plt.figure(figsize=(22, 18))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    "Volatility Clustering & Market Regimes  (30-second buckets)\n"
+    f"Regime thresholds: Low < {q33:.5f}  ≤  Med < {q66:.5f}  ≤  High",
+    fontsize=13, fontweight="bold", color=C_BLUE, y=1.005
+)
+gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.5, wspace=0.38)
+
+# ── Panel A: Time-series with regime shading ─────────────────────────
+ax_ts = fig.add_subplot(gs[0, :])
+for _, row in sample_ts.iterrows():
+    ax_ts.axvspan(row["time_bucket"] - 0.5, row["time_bucket"] + 0.5,
+                  color=REG_COLORS[row["regime"]], alpha=0.28, linewidth=0)
+ax_ts.plot(sample_ts["time_bucket"], sample_ts["rv"],
+           color=C_BLUE, linewidth=1.8, zorder=3, label="RV")
+ax_ts.fill_between(sample_ts["time_bucket"], sample_ts["rv"],
+                   alpha=0.12, color=C_BLUE)
+ax_ts.axhline(q33, color=C_GREEN,  linestyle="--", linewidth=0.9, alpha=0.8, label=f"q33={q33:.5f}")
+ax_ts.axhline(q66, color=C_ORANGE, linestyle="--", linewidth=0.9, alpha=0.8, label=f"q66={q66:.5f}")
+ax_ts.set_title(
+    f"Volatility Clustering — stock {sample_stock}, time_id {sample_tid}\n"
+    "Background shading = market regime (green=Low, gold=Med, orange=High)",
+    fontsize=10, color=C_GREY
+)
+ax_ts.set_xlabel("30-second bucket index"); ax_ts.set_ylabel("Realised Volatility")
+regime_patches = [mpatches.Patch(color=REG_COLORS[r], alpha=0.6, label=REG_LABELS[r])
+                  for r in [0, 1, 2]]
+ax_ts.legend(handles=regime_patches + ax_ts.get_legend_handles_labels()[0][1:],
+             loc="upper right", fontsize=8)
+
+# ── Panel B: Regime distribution ─────────────────────────────────────
+ax_reg = fig.add_subplot(gs[1, 0])
+counts = train["regime"].value_counts().sort_index()
+ax_reg.bar([REG_LABELS[r] for r in counts.index], counts.values,
+           color=[REG_COLORS[r] for r in counts.index], alpha=0.85, edgecolor="none")
+ax_reg.set_title("Regime Distribution\n(all stocks, train set)", fontsize=9, color=C_GREY)
+ax_reg.set_ylabel("Row count")
+
+# ── Panel C: Mean BAS by regime  (spread widens in high-vol) ─────────
+ax_bas = fig.add_subplot(gs[1, 1])
+bas_reg = train.groupby("regime")["bas"].mean()
+ax_bas.bar([REG_LABELS[r] for r in bas_reg.index], bas_reg.values,
+           color=[REG_COLORS[r] for r in bas_reg.index], alpha=0.85, edgecolor="none")
+ax_bas.set_title("Mean Bid-Ask Spread by Regime\n(wider spread → higher vol)", fontsize=9, color=C_GREY)
+ax_bas.set_ylabel("Mean BAS")
+
+# ── Panel D: Mean activity proxy by regime ────────────────────────────
+ax_act = fig.add_subplot(gs[1, 2])
+act_reg = train.groupby("regime")["log_activity"].mean()
+ax_act.bar([REG_LABELS[r] for r in act_reg.index], act_reg.values,
+           color=[REG_COLORS[r] for r in act_reg.index], alpha=0.85, edgecolor="none")
+ax_act.set_title("Mean log(Activity) by Regime\n(activity proxy for order flow)", fontsize=9, color=C_GREY)
+ax_act.set_ylabel("Mean log_activity")
+
+# ── Panel E: Cross-stock regime fraction heatmap ──────────────────────
+ax_heat = fig.add_subplot(gs[2, :2])
+top_stocks = train["stock_id"].value_counts().head(20).index
+heat_df = (
+    train[train["stock_id"].isin(top_stocks)]
+    .groupby(["stock_id", "regime"]).size()
+    .unstack(fill_value=0)
+    .rename(columns=REG_LABELS)
+)
+heat_pct = heat_df.div(heat_df.sum(axis=1), axis=0)
+cmap_reg = LinearSegmentedColormap.from_list("regime", [C_GREEN, C_GOLD, C_ORANGE])
+sns.heatmap(heat_pct, ax=ax_heat, cmap=cmap_reg,
+            annot=True, fmt=".2f", linewidths=0.3,
+            annot_kws={"size": 7}, vmin=0, vmax=1,
+            cbar_kws={"shrink": 0.7})
+ax_heat.set_title("Fraction of Time in Each Regime per Stock\n(cross-sectional dispersion)",
+                  fontsize=9, color=C_GREY)
+ax_heat.set_xlabel(""); ax_heat.set_ylabel("stock_id")
+
+# ── Panel F: RV autocorrelation (persistence justification) ──────────
+ax_acf = fig.add_subplot(gs[2, 2])
+rv_series = (
+    train[train["stock_id"] == sample_stock]
+    .sort_values(["time_id", "time_bucket"])["rv"]
+    .dropna().values
+)
+MAX_LAG = 15
+acf_vals = np.array([
+    np.corrcoef(rv_series[:-lag], rv_series[lag:])[0, 1] if lag > 0 else 1.0
+    for lag in range(MAX_LAG + 1)
+])
+ci = 1.96 / np.sqrt(len(rv_series))
+ax_acf.bar(range(MAX_LAG + 1), acf_vals, color=C_BLUE, alpha=0.8, edgecolor="none")
+ax_acf.axhline( ci, color=C_ORANGE, linestyle="--", linewidth=0.9, label="95% CI")
+ax_acf.axhline(-ci, color=C_ORANGE, linestyle="--", linewidth=0.9)
+ax_acf.axhline(0,   color=C_GREY,   linewidth=0.7)
+ax_acf.set_title(
+    f"RV Autocorrelation  (stock {sample_stock})\n"
+    "→ strong persistence justifies rv_lag1, rv_lag2 features",
+    fontsize=9, color=C_GREY
+)
+ax_acf.set_xlabel("Lag (×30 sec)"); ax_acf.set_ylabel("ACF")
+ax_acf.legend(fontsize=8)
+
+plt.savefig(OUT + "cluster_plots.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: cluster_plots.png  ✓")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 6 — COVARIATE FINAL SET
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 6 — COVARIATE FINAL SET")
+print("=" * 70)
+
+FINAL_FEATURES = [
+    # ── RV persistence ────────────────────────────────────────────
+    "rv_lag1",               # strongest signal; volatility clusters over 30-s windows
+    "rv_lag2",               # secondary persistence
+    "rv_roll_mean",          # rolling mean: trend component
+    "rv_roll_sd",            # rolling SD: vol-of-vol
+    "rv_roll_cv",            # coefficient of variation (relative dispersion)
+    # ── Bid-ask spread ────────────────────────────────────────────
+    "bas",                   # raw spread level (liquidity cost)
+    "rel_spread",            # BAS / WAP: price-normalised spread
+    "bas_change",            # spread dynamics (widening/tightening)
+    "bas_roll_mean",         # rolling spread baseline
+    # ── Price covariates ──────────────────────────────────────────
+    "wap_return",            # log price momentum (30-s return)
+    "wap_dev",               # deviation from rolling WAP mean
+    # ── Order-flow proxies ────────────────────────────────────────
+    "inv_spread",            # inverse spread ≈ num-orders proxy
+    "log_activity",          # log(WAP × inv_spread): activity proxy
+    "volume_surge",          # relative activity spike
+    # ── Interaction terms ─────────────────────────────────────────
+    "spread_vol_interaction",# spread level × lagged vol
+    "rel_spread_vol",        # normalised spread × lagged vol
+    "activity_vol",          # order-activity × lagged vol
+    # ── Nonlinear ─────────────────────────────────────────────────
+    "rv_lag1_sq",            # squared lag (ARCH-like nonlinearity)
+]
+
+print(f"\n{'Feature':<30} {'r with RV':>10}  Group")
+print("─" * 62)
+GROUP_MAP = {
+    "rv_lag1": "RV persistence",   "rv_lag2": "RV persistence",
+    "rv_roll_mean": "RV persistence", "rv_roll_sd": "RV persistence",
+    "rv_roll_cv": "RV persistence",
+    "bas": "Bid-Ask Spread",        "rel_spread": "Bid-Ask Spread",
+    "bas_change": "Bid-Ask Spread", "bas_roll_mean": "Bid-Ask Spread",
+    "wap_return": "Price",          "wap_dev": "Price",
+    "inv_spread": "Order-flow",     "log_activity": "Order-flow",
+    "volume_surge": "Order-flow",
+    "spread_vol_interaction": "Interaction", "rel_spread_vol": "Interaction",
+    "activity_vol": "Interaction",
+    "rv_lag1_sq": "Nonlinear",
+}
 for f in FINAL_FEATURES:
-    corr_val = rv_corrs.get(f, np.nan)
-    print(f"  {f:<30} r={corr_val:+.4f}")
- 
-# ─────────────────────────────────────────────
-# 9. PREPARE MATRICES
-# ─────────────────────────────────────────────
+    r = rv_corrs.get(f, np.nan)
+    print(f"  {f:<28} {r:>+10.4f}  {GROUP_MAP.get(f, '')}")
+print(f"\nTotal final features: {len(FINAL_FEATURES)}")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 7 — PREPARE MATRICES
+# ═════════════════════════════════════════════════════════════════════
 train_clean = train.dropna(subset=FINAL_FEATURES + [TARGET])
 test_clean  = test.dropna(subset=FINAL_FEATURES + [TARGET])
- 
+
 X_train     = train_clean[FINAL_FEATURES].values
 y_train     = train_clean[TARGET].values
 X_test      = test_clean[FINAL_FEATURES].values
 y_test      = test_clean[TARGET].values
-bucket_vals = train_clean["time_bucket"].values
- 
-print(f"\nClean train rows: {len(train_clean):,} | Clean test rows: {len(test_clean):,}")
- 
-# ─────────────────────────────────────────────
-# 10. LOSS FUNCTIONS
-# ─────────────────────────────────────────────
+bucket_vals = train_clean["time_bucket"].values   # used for WLS weights
+
+print(f"\nClean train: {len(train_clean):,}   Clean val: {len(test_clean):,}")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 8 — LOSS FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════
 def qlike(y, yhat):
-    """QLIKE loss — standard volatility forecasting criterion."""
+    """QLIKE: standard loss for volatility forecast evaluation.
+    Rewards forecasts that are both close and correctly sized.
+    """
     yhat = np.maximum(yhat, 1e-8)
-    return np.mean(np.log(yhat) + y / yhat)
- 
-def mse(y, yhat):
-    return np.mean((y - yhat) ** 2)
- 
-def mae(y, yhat):
-    return np.mean(np.abs(y - yhat))
- 
-# ─────────────────────────────────────────────
-# 11. OLS BASELINE
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("OLS BASELINE")
-print("=" * 60)
-ols = LinearRegression().fit(X_train, y_train)
+    return float(np.mean(np.log(yhat) + y / yhat))
+
+def mse(y, yhat):  return float(np.mean((y - yhat) ** 2))
+def mae(y, yhat):  return float(np.mean(np.abs(y - yhat)))
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 9 — OLS BASELINE
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 9 — OLS BASELINE")
+print("=" * 70)
+
+ols      = LinearRegression().fit(X_train, y_train)
 ols_pred = np.maximum(ols.predict(X_test), 1e-8)
+
 print(f"OLS MSE:   {mse(y_test, ols_pred):.8f}")
 print(f"OLS MAE:   {mae(y_test, ols_pred):.8f}")
 print(f"OLS QLIKE: {qlike(y_test, ols_pred):.6f}")
- 
-# OLS coefficients
-coef_df = pd.DataFrame({
+
+coef_ols_df = pd.DataFrame({
     "feature":     FINAL_FEATURES,
     "coefficient": ols.coef_,
-    "abs_coef":    np.abs(ols.coef_)
-}).sort_values("abs_coef", ascending=False)
-print("\nOLS Coefficients (sorted by |coef|):")
-print(coef_df.drop("abs_coef", axis=1).to_string(index=False))
- 
-# ─────────────────────────────────────────────
-# 12. ALPHA TUNING — PARALLEL GRID SEARCH
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("ALPHA TUNING (WLS decay parameter)")
-print("=" * 60)
- 
+}).assign(abs_coef=lambda d: d["coefficient"].abs()) \
+  .sort_values("abs_coef", ascending=False)
+print("\nOLS Coefficients:")
+print(coef_ols_df[["feature", "coefficient"]].to_string(index=False))
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 10 — ALPHA TUNING  (WLS decay parameter grid search)
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 10 — ALPHA TUNING  (WLS exponential-decay weight)")
+print()
+print("  WLS WEIGHT FORMULA:")
+print("  ─────────────────────────────────────────────────────────────")
+print("  w(t) = α^(T − t)")
+print()
+print("  where  t = time_bucket index of observation (1 … T)")
+print("         T = last training bucket")
+print("         α ∈ (0, 1] = decay parameter")
+print()
+print("  Interpretation for traders:")
+print("  ─────────────────────────────────────────────────────────────")
+print("  OLS treats a 30-second window from 3 hours ago identically")
+print("  to a window from 30 seconds ago.  For intra-day vol that is")
+print("  wrong — market conditions shift.  WLS fixes this by assigning")
+print("  exponentially higher weight to more recent buckets.")
+print("  α = 0.99 → gentle decay (long memory)")
+print("  α = 0.80 → fast decay  (only the last few minutes matter)")
+print("  We select α by minimising out-of-sample QLIKE on the val set.")
+print("=" * 70)
+
 alpha_grid = np.round(np.arange(0.05, 1.00, 0.01), 3)
- 
-def fit_alpha(a, X_train, y_train, X_test, y_test, n_train, bucket_vals):
-    weights = a ** (n_train - bucket_vals)
-    wls     = LinearRegression().fit(X_train, y_train, sample_weight=weights)
-    preds   = np.maximum(wls.predict(X_test), 1e-8)
+
+def fit_alpha(a, X_train, y_train, X_test, y_test, T, bucket_vals):
+    w    = a ** (T - bucket_vals)
+    wls  = LinearRegression().fit(X_train, y_train, sample_weight=w)
+    pred = np.maximum(wls.predict(X_test), 1e-8)
     return {
         "alpha": a,
-        "qlike": qlike(y_test, preds),
-        "mse":   mse(y_test, preds),
-        "mae":   mae(y_test, preds),
+        "qlike": qlike(y_test, pred),
+        "mse":   mse(y_test, pred),
+        "mae":   mae(y_test, pred),
     }
- 
+
 tune_results = Parallel(n_jobs=-1, verbose=0)(
-    delayed(fit_alpha)(a, X_train, y_train, X_test, y_test, n_train, bucket_vals)
+    delayed(fit_alpha)(a, X_train, y_train, X_test, y_test, train_max_bucket, bucket_vals)
     for a in alpha_grid
 )
 tune_df    = pd.DataFrame(tune_results)
 best_row   = tune_df.loc[tune_df["qlike"].idxmin()]
-best_alpha = best_row["alpha"]
-print(f"Best alpha: {best_alpha:.2f}  |  Validation QLIKE: {best_row['qlike']:.6f}")
- 
-# ── Alpha tuning plot ─────────────────────────
+best_alpha = float(best_row["alpha"])
+print(f"\nBest α = {best_alpha:.2f}  |  Val QLIKE = {best_row['qlike']:.6f}")
+
+# ── Alpha tuning plot ─────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-fig.suptitle("Alpha Tuning: WLS Decay Parameter Grid Search", fontsize=14, fontweight="bold")
- 
-for ax, metric in zip(axes, ["qlike", "mse", "mae"]):
-    ax.plot(tune_df["alpha"], tune_df[metric], color="steelblue", linewidth=1.5)
-    best_val = tune_df.loc[tune_df["qlike"].idxmin(), metric]
-    ax.axvline(best_alpha, color="red", linestyle="--", linewidth=1.2,
-               label=f"Best α={best_alpha:.2f} ({metric.upper()}={best_val:.6f})")
-    ax.set_title(f"{metric.upper()} vs Alpha")
-    ax.set_xlabel("Alpha"); ax.set_ylabel(metric.upper())
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    f"Alpha Tuning — WLS Exponential Decay Grid Search\n"
+    f"Best α = {best_alpha:.2f}  →  recent 30-sec windows weighted more heavily",
+    fontsize=12, fontweight="bold", color=C_BLUE
+)
+for ax, metric, color in zip(axes, ["qlike", "mse", "mae"],
+                              [C_BLUE, C_ORANGE, C_GREEN]):
+    ax.plot(tune_df["alpha"], tune_df[metric], color=color, linewidth=1.5)
+    best_val = float(tune_df.loc[tune_df["qlike"].idxmin(), metric])
+    ax.axvline(best_alpha, color="red", linestyle="--", linewidth=1.3,
+               label=f"Best α={best_alpha:.2f}\n{metric.upper()}={best_val:.6f}")
+    ax.set_title(f"{metric.upper()} vs α")
+    ax.set_xlabel("Alpha (decay parameter)"); ax.set_ylabel(metric.upper())
     ax.legend(fontsize=8)
- 
+    ax.set_facecolor(C_BG)
 plt.tight_layout()
-plt.savefig("/Users/jamiewood/Documents/DATA3888/DATA3888G08/alpha_tuning.png", dpi=150)
+plt.savefig(OUT + "alpha_tuning.png", dpi=150, bbox_inches="tight")
 plt.show()
- 
-# ─────────────────────────────────────────────
-# 13. FINAL WLS MODEL
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("FINAL WLS MODEL")
-print("=" * 60)
-best_weights = best_alpha ** (n_train - bucket_vals)
-wls = LinearRegression().fit(X_train, y_train, sample_weight=best_weights)
-wls_pred = np.maximum(wls.predict(X_test), 1e-8)
- 
-# WLS coefficients
+print("Saved: alpha_tuning.png")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 11 — FIT FINAL WLS MODEL
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 11 — FINAL WLS MODEL")
+print("=" * 70)
+
+best_weights = best_alpha ** (train_max_bucket - bucket_vals)
+wls          = LinearRegression().fit(X_train, y_train, sample_weight=best_weights)
+wls_pred     = np.maximum(wls.predict(X_test), 1e-8)
+
 wls_coef_df = pd.DataFrame({
     "feature":         FINAL_FEATURES,
     "ols_coefficient": ols.coef_,
     "wls_coefficient": wls.coef_,
     "delta":           wls.coef_ - ols.coef_,
 }).sort_values("wls_coefficient", key=abs, ascending=False)
-print("\nOLS vs WLS Coefficients:")
+
+print("\nOLS vs WLS Coefficients (sorted by |WLS coef|):")
 print(wls_coef_df.to_string(index=False))
- 
-# ─────────────────────────────────────────────
-# 14. EVALUATION: OLS vs WLS
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("MODEL COMPARISON: OLS vs WLS")
-print("=" * 60)
- 
+
+# ─────────────────────────────────────────────────────────────────────
+# STANDALONE COEFFICIENT PLOT  (clearly labelled for report)
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    f"WLS Regression Coefficients  (α = {best_alpha:.2f})\n"
+    "We weight recent 30-second buckets more — old market conditions matter less",
+    fontsize=12, fontweight="bold", color=C_BLUE
+)
+
+n_feat = len(FINAL_FEATURES)
+y_pos  = np.arange(n_feat)
+feat_sorted = wls_coef_df["feature"].values
+
+# Panel A: OLS vs WLS side-by-side
+axes[0].set_facecolor(C_BG)
+w = 0.38
+axes[0].barh(y_pos - w/2, wls_coef_df["ols_coefficient"].values,
+             height=w, label="OLS (equal weights)", color=C_BLUE, alpha=0.75, edgecolor="none")
+axes[0].barh(y_pos + w/2, wls_coef_df["wls_coefficient"].values,
+             height=w, label=f"WLS (α={best_alpha:.2f}, recent data weighted more)",
+             color=C_ORANGE, alpha=0.75, edgecolor="none")
+axes[0].set_yticks(y_pos)
+axes[0].set_yticklabels(feat_sorted, fontsize=8)
+axes[0].axvline(0, color=C_GREY, linewidth=0.8)
+axes[0].set_title("OLS vs WLS Coefficients", fontsize=11, color=C_BLUE)
+axes[0].set_xlabel("Coefficient value")
+axes[0].legend(fontsize=9)
+axes[0].invert_yaxis()
+
+# Panel B: Delta (WLS − OLS) — shows how recency changes each coefficient
+delta_colors = [C_ORANGE if v > 0 else C_BLUE for v in wls_coef_df["delta"].values]
+axes[1].set_facecolor(C_BG)
+axes[1].barh(y_pos, wls_coef_df["delta"].values,
+             height=0.6, color=delta_colors, alpha=0.80, edgecolor="none")
+axes[1].set_yticks(y_pos)
+axes[1].set_yticklabels(feat_sorted, fontsize=8)
+axes[1].axvline(0, color=C_GREY, linewidth=0.8)
+axes[1].set_title("Δ Coefficient  (WLS − OLS)\nHow much does down-weighting old data change each signal?",
+                  fontsize=10, color=C_BLUE)
+axes[1].set_xlabel("WLS coef − OLS coef")
+axes[1].invert_yaxis()
+pos_patch = mpatches.Patch(color=C_ORANGE, label="WLS assigns larger coefficient")
+neg_patch = mpatches.Patch(color=C_BLUE,   label="WLS assigns smaller coefficient")
+axes[1].legend(handles=[pos_patch, neg_patch], fontsize=9)
+
+plt.tight_layout()
+plt.savefig(OUT + "wls_coefficient_plot.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: wls_coefficient_plot.png")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 12 — OLS vs WLS COMPARISON
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 12 — OLS vs WLS COMPARISON")
+print("=" * 70)
+
 results = pd.DataFrame({
-    "Model":   ["OLS", f"WLS (α={best_alpha:.2f})"],
-    "MSE":     [mse(y_test, ols_pred),   mse(y_test, wls_pred)],
-    "MAE":     [mae(y_test, ols_pred),   mae(y_test, wls_pred)],
-    "QLIKE":   [qlike(y_test, ols_pred), qlike(y_test, wls_pred)],
+    "Model": ["OLS (equal weights)", f"WLS (α={best_alpha:.2f}, recency-weighted)"],
+    "MSE":   [mse(y_test, ols_pred),   mse(y_test, wls_pred)],
+    "MAE":   [mae(y_test, ols_pred),   mae(y_test, wls_pred)],
+    "QLIKE": [qlike(y_test, ols_pred), qlike(y_test, wls_pred)],
 })
 print(results.to_string(index=False))
- 
-# Improvement
+print()
 for metric in ["MSE", "MAE", "QLIKE"]:
-    ols_val = results.loc[results["Model"] == "OLS", metric].values[0]
-    wls_val = results.loc[results["Model"] != "OLS", metric].values[0]
-    pct     = (ols_val - wls_val) / ols_val * 100
-    print(f"{metric} improvement (WLS over OLS): {pct:+.3f}%")
- 
-# ─────────────────────────────────────────────
-# 15. DIAGNOSTIC PLOTS: OLS vs WLS
-# ─────────────────────────────────────────────
-plot_sample_idx = np.random.choice(len(y_test), min(10_000, len(y_test)), replace=False)
-y_sample     = y_test[plot_sample_idx]
-ols_sample   = ols_pred[plot_sample_idx]
-wls_sample   = wls_pred[plot_sample_idx]
- 
+    ols_v = results.loc[0, metric]
+    wls_v = results.loc[1, metric]
+    pct   = (ols_v - wls_v) / ols_v * 100
+    direction = "improvement" if pct > 0 else "degradation"
+    print(f"  {metric}: WLS {direction} over OLS = {pct:+.3f}%")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 13 — DIAGNOSTIC PLOTS
+# ═════════════════════════════════════════════════════════════════════
+idx = np.random.choice(len(y_test), min(10_000, len(y_test)), replace=False)
+y_s   = y_test[idx]
+ols_s = ols_pred[idx]
+wls_s = wls_pred[idx]
+
 fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-fig.suptitle("OLS vs WLS — Diagnostic Plots", fontsize=16, fontweight="bold")
- 
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    f"OLS vs WLS — Diagnostic Plots  (α = {best_alpha:.2f})\n"
+    f"MSE: OLS={mse(y_test,ols_pred):.2e}  WLS={mse(y_test,wls_pred):.2e}  |  "
+    f"QLIKE: OLS={qlike(y_test,ols_pred):.4f}  WLS={qlike(y_test,wls_pred):.4f}",
+    fontsize=12, fontweight="bold", color=C_BLUE
+)
+
 # Predicted vs Actual
 for ax, pred, label, color in zip(
     [axes[0, 0], axes[0, 1]],
-    [ols_sample, wls_sample],
+    [ols_s, wls_s],
     ["OLS", f"WLS (α={best_alpha:.2f})"],
-    ["steelblue", "coral"]
+    [C_BLUE, C_ORANGE]
 ):
-    ax.scatter(y_sample, pred, alpha=0.15, s=3, color=color)
-    lim = max(y_sample.max(), pred.max())
+    ax.set_facecolor(C_BG)
+    ax.scatter(y_s, pred, alpha=0.15, s=3, color=color)
+    lim = max(y_s.max(), pred.max())
     ax.plot([0, lim], [0, lim], "k--", linewidth=1, label="Perfect forecast")
     ax.set_title(f"{label}: Predicted vs Actual RV")
     ax.set_xlabel("Actual RV"); ax.set_ylabel("Predicted RV")
     ax.legend(fontsize=8)
- 
+
 # Residuals
-ols_resid = y_sample - ols_sample
-wls_resid = y_sample - wls_sample
 for ax, resid, label, color in zip(
     [axes[1, 0], axes[1, 1]],
-    [ols_resid, wls_resid],
+    [y_s - ols_s, y_s - wls_s],
     ["OLS", f"WLS (α={best_alpha:.2f})"],
-    ["steelblue", "coral"]
+    [C_BLUE, C_ORANGE]
 ):
-    ax.hist(resid, bins=80, color=color, alpha=0.7, edgecolor="none")
-    ax.axvline(0, color="black", linestyle="--")
+    ax.set_facecolor(C_BG)
+    ax.hist(resid, bins=80, color=color, alpha=0.75, edgecolor="none")
+    ax.axvline(0, color="black", linestyle="--", linewidth=1)
     ax.set_title(f"{label}: Residual Distribution")
     ax.set_xlabel("Residual"); ax.set_ylabel("Count")
- 
-# Coefficient comparison bar chart
-ax = axes[0, 2]
-x = np.arange(len(FINAL_FEATURES))
-width = 0.35
-ax.barh(x - width/2, wls_coef_df["ols_coefficient"].values, height=width, label="OLS", color="steelblue", alpha=0.8)
-ax.barh(x + width/2, wls_coef_df["wls_coefficient"].values, height=width, label="WLS", color="coral", alpha=0.8)
-ax.set_yticks(x)
-ax.set_yticklabels(wls_coef_df["feature"].values, fontsize=7)
-ax.axvline(0, color="black", linewidth=0.8)
-ax.set_title("OLS vs WLS Coefficients")
-ax.set_xlabel("Coefficient value")
-ax.legend()
- 
-# QLIKE by time bucket (out-of-sample)
-ax = axes[1, 2]
+
+# WLS weight visualisation
+ax_w = axes[0, 2]
+ax_w.set_facecolor(C_BG)
+t_vals = np.array(sorted_buckets[:n_train])
+w_vals = best_alpha ** (train_max_bucket - t_vals)
+ax_w.bar(t_vals, w_vals, color=C_BLUE, alpha=0.75, edgecolor="none", width=0.8)
+ax_w.set_title(
+    f"WLS Training Weights  (α = {best_alpha:.2f})\n"
+    "Recent 30-sec buckets → higher weight\nOld buckets → down-weighted",
+    fontsize=9, color=C_GREY
+)
+ax_w.set_xlabel("Training bucket (30-sec windows, oldest → newest)")
+ax_w.set_ylabel(f"Weight = {best_alpha:.2f}^(T−t)")
+ax_w.annotate("Most recent\nbucket (weight=1)", xy=(train_max_bucket, 1),
+              xytext=(train_max_bucket - 4, 0.85),
+              arrowprops=dict(arrowstyle="->", color=C_ORANGE), color=C_ORANGE, fontsize=8)
+
+# QLIKE per time bucket
+ax_q = axes[1, 2]
+ax_q.set_facecolor(C_BG)
 test_eval = test_clean.copy()
 test_eval["ols_pred"] = ols_pred
 test_eval["wls_pred"] = wls_pred
-bucket_perf = test_eval.groupby("time_bucket").apply(
+bperf = test_eval.groupby("time_bucket").apply(
     lambda g: pd.Series({
         "ols_qlike": qlike(g[TARGET].values, g["ols_pred"].values),
         "wls_qlike": qlike(g[TARGET].values, g["wls_pred"].values),
     })
 ).reset_index()
-ax.plot(bucket_perf["time_bucket"], bucket_perf["ols_qlike"], label="OLS", color="steelblue", marker="o")
-ax.plot(bucket_perf["time_bucket"], bucket_perf["wls_qlike"], label=f"WLS (α={best_alpha:.2f})", color="coral", marker="s")
-ax.set_title("QLIKE per Time Bucket (Val set)")
-ax.set_xlabel("time_bucket"); ax.set_ylabel("QLIKE")
-ax.legend()
- 
+ax_q.plot(bperf["time_bucket"], bperf["ols_qlike"],
+          label="OLS", color=C_BLUE, marker="o", markersize=4, linewidth=1.4)
+ax_q.plot(bperf["time_bucket"], bperf["wls_qlike"],
+          label=f"WLS (α={best_alpha:.2f})", color=C_ORANGE, marker="s", markersize=4, linewidth=1.4)
+ax_q.set_title("QLIKE per Time Bucket  (val set)")
+ax_q.set_xlabel("time_bucket (30-sec window)"); ax_q.set_ylabel("QLIKE")
+ax_q.legend(fontsize=9)
+
 plt.tight_layout()
-plt.savefig("/Users/jamiewood/Documents/DATA3888/DATA3888G08/ols_vs_wls_diagnostics.png", dpi=150)
+plt.savefig(OUT + "ols_vs_wls_diagnostics.png", dpi=150, bbox_inches="tight")
 plt.show()
- 
-# ─────────────────────────────────────────────
-# 16. FINAL SUMMARY
-# ─────────────────────────────────────────────
-print("\n" + "=" * 60)
+print("Saved: ols_vs_wls_diagnostics.png")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 14 — SAVE  m2_wls_predictions.csv
+#   Required format: stock_id, time_id, actual_rv, predicted_rv
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 14 — SAVE  m2_wls_predictions.csv")
+print("=" * 70)
+
+predictions_df = test_clean[["stock_id", "time_id", "time_bucket"]].copy()
+predictions_df["actual_rv"]    = y_test
+predictions_df["predicted_rv"] = wls_pred
+predictions_df["residual"]     = y_test - wls_pred
+predictions_df["model"]        = f"WLS_alpha_{best_alpha:.2f}"
+
+out_path = OUT + "m2_wls_predictions.csv"
+predictions_df.to_csv(out_path, index=False)
+print(f"Saved : {out_path}")
+print(f"Shape : {predictions_df.shape}")
+print(predictions_df.head(10).to_string(index=False))
+
+# Quick sanity check
+assert "stock_id"     in predictions_df.columns
+assert "time_id"      in predictions_df.columns
+assert "actual_rv"    in predictions_df.columns
+assert "predicted_rv" in predictions_df.columns
+print("\n[CHECK] m2_wls_predictions.csv columns verified ✓")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 15 — FINAL SUMMARY
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
 print("FINAL SUMMARY")
-print("=" * 60)
+print("=" * 70)
 print(results.to_string(index=False))
-print(f"\nBest WLS decay parameter α = {best_alpha:.2f}")
-print(f"Features used: {len(FINAL_FEATURES)}")
+print()
+print(f"Best WLS decay parameter  α = {best_alpha:.2f}")
+print(f"Features in final model     : {len(FINAL_FEATURES)}")
+print(f"30-second buckets per window: {N_EXPECTED_BUCKETS}")
+print(f"Train buckets               : {n_train}  (buckets 1–{train_max_bucket})")
+print(f"Val   buckets               : {n_val}  (buckets {train_max_bucket+1}–20)")
+print()
+print("Files written:")
+for f in [
+    "eda_distributions.png",
+    "feature_selection_correlation.png",
+    "correlation_heatmap.png",
+    "spread_features_eda.png",
+    "order_flow_features_eda.png",
+    "cluster_plots.png",              # ← required output
+    "alpha_tuning.png",
+    "wls_coefficient_plot.png",
+    "ols_vs_wls_diagnostics.png",
+    "m2_wls_predictions.csv",         # ← required output
+]:
+    print(f"  {OUT}{f}")
 print("\nDone.")
- 
