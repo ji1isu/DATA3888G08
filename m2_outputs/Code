@@ -1,7 +1,7 @@
-Member 2: WLS Volatility Forecasting Pipeline
+"""
+Member 2 (Jamie): WLS Volatility Forecasting Pipeline
 
 Source data : optiver_aggregated.csv
-              (aggregated from individual_book_train/*.csv)
               Columns: stock_id, time_id, time_bucket,
                        WAP_mean, BidAskSpread_mean, volatility
 
@@ -9,22 +9,31 @@ Source data : optiver_aggregated.csv
                     Each bucket represents exactly 30 seconds of a
                     600-second auction window.
 
+Liquidity Regime Pipeline
+  Jamie is responsible for:
+    1. EDA that divides time buckets into highly liquid (tight spread,
+       high volume) and illiquid (wide spread, low volume) regimes.
+    2. Classifying stocks (not just time periods) as liquid/illiquid
+       using their median BAS and activity proxy.
+    3. Exporting liquidity profiles so Jisu/GARCH can cross-reference
+       with blown-up predictions, and so the app can dynamically
+       recommend the best model per stock.
+    4. Re-running WLS evaluation separately on liquid vs illiquid
+       stocks to prove WLS stability where EGARCH-X blows up.
 
 Trader summary
-  "Standard regression (OLS) treats every data point equally, whether
-   it came from 10 minutes ago or 10 months ago.  For fast-moving
-   markets this is a problem — old market conditions can dilute the
-   signal from today's trading.  WLS fixes this by assigning an
-   exponentially decaying weight:  w = α^(T − t),  where t is the
-   bucket index and T is the last training bucket.  When α is close to
-   1 the decay is gentle; when α is small, only very recent buckets
-   matter.  We grid-search α on validation QLIKE (the standard
-   volatility-forecast loss) so the model automatically learns how
-   quickly the market forgets its past.  The result: recent 30-second
-   windows count for more, older ones count for less — exactly what a
-   trader wants when conditions can shift within a single session."
+  "Standard regression (OLS) treats every data point equally.
+   WLS fixes this with exponentially decaying weights w = α^(T−t),
+   so recent 30-second windows count for more — exactly what a trader
+   wants when conditions can shift within a single session.
+   Additionally, not every stock behaves the same: a liquid stock
+   with a tight bid-ask spread is an ideal candidate for complex
+   EGARCH-X modelling. But when order books are thin and spreads
+   widen, GARCH maths can diverge. WLS remains numerically stable
+   in those illiquid regimes, making it the reliable fallback model
+   the team's dynamic trading assistant needs."
+"""
 
-# ─────────────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -37,7 +46,7 @@ from joblib import Parallel, delayed
 import warnings
 warnings.filterwarnings("ignore")
 
-# Colours
+# PALETTE
 C_BLUE   = "#1F4E79"
 C_ORANGE = "#C55A11"
 C_GREEN  = "#375623"
@@ -46,6 +55,8 @@ C_GOLD   = "#BF8F00"
 C_GREY   = "#595959"
 C_LGREY  = "#D9D9D9"
 C_BG     = "#F7F9FC"
+C_RED    = "#C00000"
+C_TEAL   = "#006A6A"
 
 plt.rcParams.update({
     "figure.facecolor":  C_BG,
@@ -66,8 +77,8 @@ plt.rcParams.update({
 OUT = "/Users/jamiewood/Documents/DATA3888/DATA3888G08/"
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 1 — LOAD & VALIDATE
-# ═════════════════════════════════════════════════════════════════════
+# Section 1 — Load & Validate
+
 print("=" * 70)
 print("SECTION 1 — LOAD & VALIDATE DATA")
 print("=" * 70)
@@ -76,19 +87,6 @@ df = pd.read_csv(OUT + "optiver_aggregated.csv")
 print(f"Shape : {df.shape}")
 print(df.head())
 
-# ── 30-second bucket contract ────────────────────────────────────────
-#
-#   The aggregation step used:
-#       time_bucket = CEIL(seconds_in_bucket / 30)
-#
-#   CEIL(0 / 30) = 0  →  rows where seconds_in_bucket = 0 land in
-#   bucket 0.  These are opening-snapshot rows with log_return = 0
-#   (no prior price to diff against).  Buckets 1–20 each represent a
-#   genuine 30-second trading interval.
-#
-#   We drop bucket 0 here so every retained row has a meaningful RV,
-#   leaving exactly 20 buckets (1 … 20) = 600 seconds total.
-#
 BUCKET_SECONDS     = 30
 WINDOW_SECONDS     = 600
 N_EXPECTED_BUCKETS = WINDOW_SECONDS // BUCKET_SECONDS   # 20
@@ -101,18 +99,16 @@ if bmin == 0:
     n_dropped = int((df["time_bucket"] == 0).sum())
     df = df[df["time_bucket"] > 0].copy()
     print(f"[BUCKET CHECK]  dropped {n_dropped:,} bucket-0 rows "
-          f"(CEIL(0/30)=0, opening snapshot, RV=0 by construction)")
+          f"(opening snapshot, RV=0 by construction)")
 
 observed = df["time_bucket"].nunique()
 print(f"[BUCKET CHECK]  retained unique={observed}  "
       f"min={int(df['time_bucket'].min())}  max={int(df['time_bucket'].max())}")
-print(f"[BUCKET CHECK]  expected {N_EXPECTED_BUCKETS} buckets of {BUCKET_SECONDS}s each")
 assert observed == N_EXPECTED_BUCKETS, (
     f"Expected {N_EXPECTED_BUCKETS} buckets after dropping bucket 0, got {observed}."
 )
 print("[BUCKET CHECK]  ✓  confirmed — buckets 1–20, each = 30 seconds\n")
 
-# ── Rename ────────────────────────────────────────────────────────────
 df = df.rename(columns={
     "WAP_mean":           "wap",
     "BidAskSpread_mean":  "bas",
@@ -121,18 +117,17 @@ df = df.rename(columns={
 df = df.sort_values(["stock_id", "time_id", "time_bucket"]).reset_index(drop=True)
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 2 — TRAIN / VAL SPLIT  (80 / 20 on time_bucket)
-# ═════════════════════════════════════════════════════════════════════
+# Section 2 — Train / Validate Split  (80 / 20 on time_bucket)
+
 print("=" * 70)
 print("SECTION 2 — TRAIN / VAL SPLIT")
 print("=" * 70)
 
-n_buckets = df["time_bucket"].nunique()              # 20  (buckets 1–20)
-n_train   = int(n_buckets * 0.8)                     # 16 → 480 s
-n_val     = n_buckets - n_train                      #  4 → 120 s
-# Work with sorted bucket labels so split is label-safe
+n_buckets         = df["time_bucket"].nunique()
+n_train           = int(n_buckets * 0.8)
+n_val             = n_buckets - n_train
 sorted_buckets    = sorted(df["time_bucket"].unique())
-train_max_bucket  = sorted_buckets[n_train - 1]      # label of last train bucket
+train_max_bucket  = sorted_buckets[n_train - 1]
 
 print(f"  Total buckets : {n_buckets}  ({n_buckets * BUCKET_SECONDS}s)")
 print(f"  Train buckets : {n_train}    (buckets 1–{train_max_bucket}, {n_train*BUCKET_SECONDS}s)")
@@ -143,89 +138,65 @@ test  = df[df["time_bucket"] >  train_max_bucket].copy()
 print(f"  Train rows : {len(train):,}   Val rows : {len(test):,}")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 3 — FEATURE ENGINEERING
-#   Covariate groups:
-#     (A) RV lags / rolling          — volatility persistence
-#     (B) Bid-ask spread             — liquidity / information asymmetry
-#     (C) Price (WAP)                — momentum / mean-reversion
-#     (D) Order-flow proxies         — derived from bid/ask sizes via WAP
-#     (E) Interaction terms          — spread × vol, etc.
-#     (F) Nonlinear terms            — squared lags
-# ═════════════════════════════════════════════════════════════════════
+# Section 3 — Feature Engineering
+
 print("\n" + "=" * 70)
 print("SECTION 3 — FEATURE ENGINEERING  (30-second buckets)")
 print("=" * 70)
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all covariates grouped by type."""
     df  = df.sort_values(["stock_id", "time_id", "time_bucket"]).copy()
     grp = df.groupby(["stock_id", "time_id"])
 
-    # ── A. RV lags & rolling ─────────────────────────────────────────
+    # A. RV lags & rolling
     df["rv_lag1"]      = grp["rv"].shift(1)
     df["rv_lag2"]      = grp["rv"].shift(2)
     df["rv_lag3"]      = grp["rv"].shift(3)
     df["rv_roll_mean"] = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).mean())
     df["rv_roll_sd"]   = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).std())
     df["rv_roll_max"]  = grp["rv"].transform(lambda x: x.rolling(5, min_periods=1).max())
-    # Coefficient of variation = SD / mean  (relative dispersion of recent vol)
     df["rv_roll_cv"]   = df["rv_roll_sd"] / (df["rv_roll_mean"] + 1e-12)
 
-    # ── B. Bid-ask spread covariates ─────────────────────────────────
-    df["bas_lag1"]       = grp["bas"].shift(1)
-    # Relative spread = BAS / WAP  (price-normalised liquidity cost)
-    df["rel_spread"]     = df["bas"] / (df["wap"] + 1e-12)
-    df["rel_spread_lag1"]= grp["rel_spread"].shift(1)
-    # Spread dynamics
-    df["bas_change"]     = df["bas"] - df["bas_lag1"]
-    df["bas_pct_change"] = df["bas_change"] / (df["bas_lag1"] + 1e-12)
-    df["bas_roll_mean"]  = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    df["bas_roll_sd"]    = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).std())
-    df["bas_sq"]         = df["bas"] ** 2   # nonlinear spread term
+    # B. Bid-ask spread
+    df["bas_lag1"]        = grp["bas"].shift(1)
+    df["rel_spread"]      = df["bas"] / (df["wap"] + 1e-12)
+    df["rel_spread_lag1"] = grp["rel_spread"].shift(1)
+    df["bas_change"]      = df["bas"] - df["bas_lag1"]
+    df["bas_pct_change"]  = df["bas_change"] / (df["bas_lag1"] + 1e-12)
+    df["bas_roll_mean"]   = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).mean())
+    df["bas_roll_sd"]     = grp["bas"].transform(lambda x: x.rolling(5, min_periods=1).std())
+    df["bas_sq"]          = df["bas"] ** 2
 
-    # ── C. Price covariates ──────────────────────────────────────────
+    # C. Price covariates
     df["wap_lag1"]      = grp["wap"].shift(1)
     df["wap_lag2"]      = grp["wap"].shift(2)
-    # Log return between consecutive 30-second buckets
     df["wap_return"]    = np.log(df["wap"] / (df["wap_lag1"] + 1e-12))
     df["wap_return2"]   = np.log(df["wap"] / (df["wap_lag2"] + 1e-12))
     df["wap_roll_mean"] = grp["wap"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    # Mean-reversion signal: how far price is from its recent average
     df["wap_dev"]       = df["wap"] - df["wap_roll_mean"]
-    # Price acceleration = change in log-return between consecutive buckets
     df["wap_accel"]     = df["wap_return"] - grp["wap_return"].shift(1)
 
-    # ── D. Order-flow proxies ────────────────────────────────────────
-    #   The aggregated file contains only WAP and BAS; we derive
-    #   order-flow signals from the spread and its dynamics because
-    #   raw bid/ask sizes are not available post-aggregation.
-    #
-    #   num_orders proxy  : inverse of spread (tight spread → many orders)
+    # D. Order-flow proxies
     df["inv_spread"]        = 1.0 / (df["bas"] + 1e-6)
     df["inv_spread_lag1"]   = grp["inv_spread"].shift(1)
     df["inv_spread_roll"]   = grp["inv_spread"].transform(
                                   lambda x: x.rolling(5, min_periods=1).mean())
-    #
-    #   volume proxy        : WAP × inv_spread  (activity proxy)
     df["activity_proxy"]    = df["wap"] * df["inv_spread"]
     df["log_activity"]      = np.log1p(df["activity_proxy"])
     df["log_activity_lag1"] = grp["log_activity"].shift(1)
-    #
-    #   order-imbalance proxy: signed spread change normalised by level
-    #   (positive = ask-side widening → sell pressure)
     df["spread_imbalance"]  = df["bas_pct_change"]
     df["volume_surge"]      = df["inv_spread"] / (df["inv_spread_roll"] + 1e-12)
 
-    # ── E. Interaction terms ─────────────────────────────────────────
-    df["spread_vol_interaction"] = df["bas"]         * df["rv_lag1"]
-    df["rel_spread_vol"]         = df["rel_spread"]  * df["rv_lag1"]
-    df["spread_change_vol"]      = df["bas_change"]  * df["rv_lag1"]
-    df["activity_vol"]           = df["log_activity"]* df["rv_lag1"]
-    df["wap_vol_interaction"]    = df["wap_return"]  * df["rv_lag1"]
+    # E. Interaction terms
+    df["spread_vol_interaction"] = df["bas"]          * df["rv_lag1"]
+    df["rel_spread_vol"]         = df["rel_spread"]   * df["rv_lag1"]
+    df["spread_change_vol"]      = df["bas_change"]   * df["rv_lag1"]
+    df["activity_vol"]           = df["log_activity"] * df["rv_lag1"]
+    df["wap_vol_interaction"]    = df["wap_return"]   * df["rv_lag1"]
 
-    # ── F. Nonlinear terms ───────────────────────────────────────────
-    df["rv_lag1_sq"]  = df["rv_lag1"] ** 2
-    df["bas_sq"]      = df["bas"] ** 2
+    # F. Nonlinear
+    df["rv_lag1_sq"] = df["rv_lag1"] ** 2
+    df["bas_sq"]     = df["bas"] ** 2
 
     return df
 
@@ -234,33 +205,153 @@ train = add_features(train)
 print("Engineering val   features …")
 test  = add_features(test)
 
-# ── Candidate feature list for EDA ───────────────────────────────────
 ALL_FEATURES = [
-    # RV lags/rolling
     "rv_lag1", "rv_lag2", "rv_lag3",
     "rv_roll_mean", "rv_roll_sd", "rv_roll_max", "rv_roll_cv",
-    # Bid-ask spread
     "bas", "bas_lag1", "rel_spread", "rel_spread_lag1",
     "bas_change", "bas_pct_change", "bas_roll_mean", "bas_roll_sd",
-    # Price
     "wap", "wap_return", "wap_return2", "wap_dev", "wap_accel",
-    # Order-flow proxies
     "inv_spread", "inv_spread_lag1", "log_activity", "log_activity_lag1",
     "spread_imbalance", "volume_surge",
-    # Interactions
     "spread_vol_interaction", "rel_spread_vol",
     "spread_change_vol", "activity_vol",
-    # Nonlinear
     "rv_lag1_sq", "bas_sq",
 ]
 TARGET = "rv"
 print(f"Candidate features: {len(ALL_FEATURES)}")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 4 — EDA  (parallel per-stock stats)
+# Section 4 — Liquidity Regime Classification
+
+# Classify STOCKS as liquid/illiquid, not just
+# time periods. This output will be used by:
+#   • Jisu: cross-reference with GARCH blow-up predictions
+#   • App:  display stock's "Liquidity Profile" and recommend model
+#   • Rosa: re-evaluate HAR-RV on illiquid stocks Jamie identifies
+
+print("\n" + "=" * 70)
+print("SECTION 4 — LIQUIDITY REGIME CLASSIFICATION")
+print("=" * 70)
+
+# ── 4A. BUCKET-LEVEL liquidity regimes ───────────────────────────────
+# Classify each (stock_id, time_id, time_bucket) row as liquid/illiquid
+# Liquid   = tight spread (low BAS) AND high activity (high inv_spread)
+# Illiquid = wide spread (high BAS) AND low activity
+
+bas_q33   = train["bas"].quantile(0.33)
+bas_q66   = train["bas"].quantile(0.66)
+act_q33   = train["log_activity"].quantile(0.33)
+act_q66   = train["log_activity"].quantile(0.66)
+
+print(f"\n  BAS thresholds  : Low < {bas_q33:.6f}  ≤  Med < {bas_q66:.6f}  ≤  High")
+print(f"  Activity thresh : Low < {act_q33:.4f}  ≤  Med < {act_q66:.4f}  ≤  High")
+
+def bucket_liquidity_label(bas_val, act_val, bas_lo, bas_hi, act_lo, act_hi):
+    """
+    Classify a single bucket as:
+      'liquid'   — tight spread AND high activity
+      'illiquid' — wide spread AND low activity
+      'mixed'    — everything in between
+    """
+    spread_tight  = bas_val <= bas_lo
+    spread_wide   = bas_val >= bas_hi
+    activity_high = act_val >= act_hi
+    activity_low  = act_val <= act_lo
+
+    if spread_tight and activity_high:
+        return "liquid"
+    elif spread_wide and activity_low:
+        return "illiquid"
+    else:
+        return "mixed"
+
+for frame in [train, test]:
+    frame["bucket_liquidity"] = frame.apply(
+        lambda r: bucket_liquidity_label(
+            r["bas"], r["log_activity"],
+            bas_q33, bas_q66, act_q33, act_q66
+        ), axis=1
+    )
+
+bucket_counts = train["bucket_liquidity"].value_counts()
+print(f"\n  Bucket-level regime counts (train):")
+for lbl, cnt in bucket_counts.items():
+    pct = 100 * cnt / len(train)
+    print(f"    {lbl:<10}: {cnt:>10,}  ({pct:.1f}%)")
+
+# ── 4B. STOCK-LEVEL liquidity profile ────────────────────────────────
+# Per team feedback: "Check which stocks specifically are liquid or
+# illiquid, not just periods of time."
+#
+# Aggregate per stock over the FULL training set:
+#   median_bas         — typical spread level
+#   median_log_activity— typical order activity
+#   liquid_pct         — fraction of buckets classified as liquid
+#   illiquid_pct       — fraction of buckets classified as illiquid
+#   volatility_mean    — mean RV for reference
+
+print("\n  Computing per-stock liquidity profiles …")
+
+stock_liquidity = (
+    train.groupby("stock_id")
+    .agg(
+        median_bas          = ("bas",              "median"),
+        median_log_activity = ("log_activity",     "median"),
+        median_rv           = ("rv",               "median"),
+        mean_rv             = ("rv",               "mean"),
+        rv_std              = ("rv",               "std"),
+        liquid_pct          = ("bucket_liquidity", lambda x: (x == "liquid").mean()),
+        illiquid_pct        = ("bucket_liquidity", lambda x: (x == "illiquid").mean()),
+        mixed_pct           = ("bucket_liquidity", lambda x: (x == "mixed").mean()),
+        n_buckets           = ("rv",               "count"),
+    )
+    .reset_index()
+)
+
+# Classify each stock overall using its dominant liquidity fraction
+def stock_regime(row):
+    if row["liquid_pct"] >= 0.40:
+        return "liquid"
+    elif row["illiquid_pct"] >= 0.40:
+        return "illiquid"
+    else:
+        return "mixed"
+
+stock_liquidity["stock_regime"] = stock_liquidity.apply(stock_regime, axis=1)
+
+# Recommended model per stock (for the app)
+def recommended_model(regime):
+    if regime == "liquid":
+        return "EGARCH-X"      # stable maths, maximum nuance
+    elif regime == "illiquid":
+        return "WLS / HAR-RV"  # numerically stable fallback
+    else:
+        return "WLS / HAR-RV"  # mixed → conservative fallback
+
+stock_liquidity["recommended_model"] = stock_liquidity["stock_regime"].apply(recommended_model)
+
+regime_counts = stock_liquidity["stock_regime"].value_counts()
+print(f"\n  Stock-level regime summary:")
+for r, c in regime_counts.items():
+    pct = 100 * c / len(stock_liquidity)
+    print(f"    {r:<10}: {c:>4} stocks  ({pct:.1f}%)")
+
+print(f"\n  Per-stock liquidity profile (first 15):")
+print(stock_liquidity[[
+    "stock_id", "median_bas", "median_log_activity",
+    "liquid_pct", "illiquid_pct", "stock_regime", "recommended_model"
+]].head(15).to_string(index=False))
+
+# Save liquidity profile for the team
+liquidity_out = OUT + "m2_stock_liquidity_profile.csv"
+stock_liquidity.to_csv(liquidity_out, index=False)
+print(f"\n  Saved: m2_stock_liquidity_profile.csv  (for Jisu + App)")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 5 — EDA  (standard + liquidity-focused)
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 4 — EDA")
+print("SECTION 5 — EDA")
 print("=" * 70)
 
 eda_sample = train.sample(min(50_000, len(train)), random_state=42)
@@ -269,14 +360,14 @@ def stock_eda_stats(sid, df):
     sub = df[df["stock_id"] == sid]
     rv  = sub["rv"].dropna()
     return {
-        "stock_id":    sid,
-        "rv_mean":     rv.mean(),
-        "rv_std":      rv.std(),
-        "rv_skew":     rv.skew(),
-        "rv_kurt":     rv.kurt(),
-        "rv_q95":      rv.quantile(0.95),
-        "bas_mean":    sub["bas"].dropna().mean(),
-        "activity_mean": sub["log_activity"].dropna().mean(),
+        "stock_id":       sid,
+        "rv_mean":        rv.mean(),
+        "rv_std":         rv.std(),
+        "rv_skew":        rv.skew(),
+        "rv_kurt":        rv.kurt(),
+        "rv_q95":         rv.quantile(0.95),
+        "bas_mean":       sub["bas"].dropna().mean(),
+        "activity_mean":  sub["log_activity"].dropna().mean(),
     }
 
 stock_ids = train["stock_id"].unique()
@@ -288,7 +379,6 @@ stock_stats_df = pd.DataFrame(stock_stats).set_index("stock_id")
 print("\nPer-stock summary (first 10):")
 print(stock_stats_df.head(10).to_string())
 
-# ── Correlations with target ──────────────────────────────────────────
 rv_corrs = (
     eda_sample[ALL_FEATURES + [TARGET]]
     .dropna()
@@ -299,19 +389,8 @@ rv_corrs = (
 print("\nTop-20 |r| with RV:")
 print(rv_corrs.head(20).to_string())
 
-# ── Correlation matrix (key subset) ──────────────────────────────────
-corr_cols = [
-    "rv", "rv_lag1", "rv_lag2",
-    "bas", "rel_spread", "bas_change",
-    "wap_return", "wap_dev",
-    "rv_roll_mean", "rv_roll_sd",
-    "log_activity", "inv_spread",
-    "spread_vol_interaction",
-]
-corr_matrix = eda_sample[corr_cols].dropna().corr()
-
 # ─────────────────────────────────────────────────────────────────────
-# EDA PLOT 1 — Distributions
+# EDA PLOT 1 — Standard covariate distributions
 # ─────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(2, 3, figsize=(20, 10))
 fig.patch.set_facecolor(C_BG)
@@ -351,7 +430,135 @@ plt.show()
 print("Saved: eda_distributions.png")
 
 # ─────────────────────────────────────────────────────────────────────
-# EDA PLOT 2 — Feature selection: |r| with RV, colour-coded by group
+# EDA PLOT 2 — Liquidity Regime EDA  (NEW — Jamie's primary output)
+#   Shows how BAS and activity separate liquid vs illiquid buckets,
+#   and how this maps to model recommendation.
+# ─────────────────────────────────────────────────────────────────────
+LIQ_COLORS = {"liquid": C_TEAL, "mixed": C_GOLD, "illiquid": C_RED}
+
+fig = plt.figure(figsize=(22, 18))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    "Liquidity Regime EDA — Identifying Liquid vs Illiquid Market Conditions\n"
+    "Jamie (Member 2) · Supports dynamic model selection in trading app",
+    fontsize=13, fontweight="bold", color=C_BLUE, y=1.005
+)
+gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.50, wspace=0.40)
+
+# Panel A: BAS vs log_activity scatter coloured by bucket regime
+ax_scatter = fig.add_subplot(gs[0, :2])
+for regime, color in LIQ_COLORS.items():
+    sub = eda_sample[eda_sample["bucket_liquidity"] == regime]
+    ax_scatter.scatter(sub["bas"], sub["log_activity"],
+                       alpha=0.20, s=4, color=color,
+                       label=f"{regime}  (n={len(sub):,})")
+ax_scatter.axvline(bas_q33, color=C_TEAL, linestyle="--", linewidth=1.0, alpha=0.8,
+                   label=f"BAS q33={bas_q33:.5f}")
+ax_scatter.axvline(bas_q66, color=C_RED,  linestyle="--", linewidth=1.0, alpha=0.8,
+                   label=f"BAS q66={bas_q66:.5f}")
+ax_scatter.axhline(act_q33, color=C_RED,  linestyle=":",  linewidth=1.0, alpha=0.8,
+                   label=f"Activity q33={act_q33:.2f}")
+ax_scatter.axhline(act_q66, color=C_TEAL, linestyle=":",  linewidth=1.0, alpha=0.8,
+                   label=f"Activity q66={act_q66:.2f}")
+ax_scatter.set_title(
+    "BAS vs log(Activity)  — Bucket Liquidity Classification\n"
+    "Teal = liquid (tight spread, high activity)  |  Red = illiquid (wide spread, low activity)",
+    fontsize=10, color=C_GREY
+)
+ax_scatter.set_xlabel("Bid-Ask Spread (BAS)"); ax_scatter.set_ylabel("log(Activity Proxy)")
+ax_scatter.legend(fontsize=8, loc="upper right")
+
+# Panel B: Bucket regime distribution
+ax_reg = fig.add_subplot(gs[0, 2])
+liq_labels = ["liquid", "mixed", "illiquid"]
+liq_cnts   = [bucket_counts.get(l, 0) for l in liq_labels]
+ax_reg.bar(liq_labels, liq_cnts,
+           color=[LIQ_COLORS[l] for l in liq_labels],
+           alpha=0.85, edgecolor="none")
+ax_reg.set_title("Bucket Liquidity\nDistribution (train)", fontsize=9, color=C_GREY)
+ax_reg.set_ylabel("Row count")
+for i, (lbl, cnt) in enumerate(zip(liq_labels, liq_cnts)):
+    pct = 100 * cnt / sum(liq_cnts)
+    ax_reg.text(i, cnt + max(liq_cnts) * 0.01, f"{pct:.1f}%",
+                ha="center", va="bottom", fontsize=8, color=C_GREY)
+
+# Panel C: RV distribution by liquidity regime
+ax_rv = fig.add_subplot(gs[1, 0])
+for regime, color in LIQ_COLORS.items():
+    vals = eda_sample.loc[eda_sample["bucket_liquidity"] == regime, "rv"].dropna()
+    ax_rv.hist(vals, bins=60, color=color, alpha=0.55, edgecolor="none",
+               label=regime, density=True)
+ax_rv.set_title("RV Distribution\nby Liquidity Regime", fontsize=9, color=C_GREY)
+ax_rv.set_xlabel("Realised Volatility"); ax_rv.set_ylabel("Density")
+ax_rv.legend(fontsize=8)
+
+# Panel D: BAS by liquidity regime
+ax_bas = fig.add_subplot(gs[1, 1])
+for regime, color in LIQ_COLORS.items():
+    vals = eda_sample.loc[eda_sample["bucket_liquidity"] == regime, "bas"].dropna()
+    ax_bas.hist(vals, bins=60, color=color, alpha=0.55, edgecolor="none",
+                label=regime, density=True)
+ax_bas.set_title("BAS Distribution\nby Liquidity Regime", fontsize=9, color=C_GREY)
+ax_bas.set_xlabel("Bid-Ask Spread"); ax_bas.set_ylabel("Density")
+ax_bas.legend(fontsize=8)
+
+# Panel E: Mean RV by liquidity regime
+ax_mrv = fig.add_subplot(gs[1, 2])
+mean_rv_by_regime = eda_sample.groupby("bucket_liquidity")["rv"].mean()
+ax_mrv.bar([l for l in liq_labels if l in mean_rv_by_regime.index],
+           [mean_rv_by_regime.get(l, 0) for l in liq_labels if l in mean_rv_by_regime.index],
+           color=[LIQ_COLORS[l] for l in liq_labels if l in mean_rv_by_regime.index],
+           alpha=0.85, edgecolor="none")
+ax_mrv.set_title("Mean RV by Liquidity Regime\n(illiquid = higher vol, GARCH can diverge)",
+                 fontsize=9, color=C_GREY)
+ax_mrv.set_ylabel("Mean Realised Volatility")
+
+# Panel F: Per-stock regime scatter (BAS vs Activity, coloured by stock regime)
+ax_stock = fig.add_subplot(gs[2, :2])
+STOCK_COLORS = {"liquid": C_TEAL, "mixed": C_GOLD, "illiquid": C_RED}
+for regime, color in STOCK_COLORS.items():
+    sub = stock_liquidity[stock_liquidity["stock_regime"] == regime]
+    ax_stock.scatter(sub["median_bas"], sub["median_log_activity"],
+                     color=color, alpha=0.85, s=60, edgecolors="white",
+                     linewidths=0.5, label=f"{regime} stock  (n={len(sub)})")
+# Annotate a few representative stocks
+top_illiquid = stock_liquidity[stock_liquidity["stock_regime"] == "illiquid"].head(5)
+for _, row in top_illiquid.iterrows():
+    ax_stock.annotate(f"S{int(row['stock_id'])}",
+                      xy=(row["median_bas"], row["median_log_activity"]),
+                      xytext=(3, 3), textcoords="offset points",
+                      fontsize=7, color=C_RED, alpha=0.8)
+ax_stock.set_title(
+    "Per-Stock Liquidity Profile  (median BAS vs median Activity)\n"
+    "Each dot = one stock.  Red = illiquid → WLS/HAR-RV recommended.  "
+    "Teal = liquid → EGARCH-X recommended.",
+    fontsize=10, color=C_GREY
+)
+ax_stock.set_xlabel("Median Bid-Ask Spread"); ax_stock.set_ylabel("Median log(Activity Proxy)")
+ax_stock.legend(fontsize=9)
+
+# Panel G: Stock regime distribution
+ax_sreg = fig.add_subplot(gs[2, 2])
+sreg_counts = stock_liquidity["stock_regime"].value_counts()
+ax_sreg.bar([l for l in liq_labels if l in sreg_counts.index],
+            [sreg_counts.get(l, 0) for l in liq_labels if l in sreg_counts.index],
+            color=[STOCK_COLORS[l] for l in liq_labels if l in sreg_counts.index],
+            alpha=0.85, edgecolor="none")
+ax_sreg.set_title("Stock Regime Distribution\n(→ app model recommendation)",
+                  fontsize=9, color=C_GREY)
+ax_sreg.set_ylabel("Number of stocks")
+sreg_total = sreg_counts.sum()
+for i, l in enumerate([l for l in liq_labels if l in sreg_counts.index]):
+    cnt = sreg_counts.get(l, 0)
+    ax_sreg.text(i, cnt + sreg_total * 0.01, f"{100*cnt/sreg_total:.1f}%",
+                 ha="center", va="bottom", fontsize=8, color=C_GREY)
+
+plt.savefig(OUT + "liquidity_regime_eda.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: liquidity_regime_eda.png  ✓  (main new EDA output)")
+
+# ─────────────────────────────────────────────────────────────────────
+# EDA PLOT 3 — Feature correlation with RV
 # ─────────────────────────────────────────────────────────────────────
 def feature_group_color(feat):
     if "rv" in feat and "spread" not in feat and "activity" not in feat:
@@ -367,7 +574,7 @@ def feature_group_color(feat):
         return C_GOLD
     return C_GREY
 
-top_n = 22
+top_n        = 22
 rv_corrs_top = rv_corrs.head(top_n)
 bar_colors   = [feature_group_color(f) for f in rv_corrs_top.index]
 
@@ -400,8 +607,18 @@ plt.show()
 print("Saved: feature_selection_correlation.png")
 
 # ─────────────────────────────────────────────────────────────────────
-# EDA PLOT 3 — Correlation heatmap
+# EDA PLOT 4 — Correlation heatmap
 # ─────────────────────────────────────────────────────────────────────
+corr_cols = [
+    "rv", "rv_lag1", "rv_lag2",
+    "bas", "rel_spread", "bas_change",
+    "wap_return", "wap_dev",
+    "rv_roll_mean", "rv_roll_sd",
+    "log_activity", "inv_spread",
+    "spread_vol_interaction",
+]
+corr_matrix = eda_sample[corr_cols].dropna().corr()
+
 plt.figure(figsize=(14, 12))
 plt.gca().set_facecolor(C_BG)
 mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
@@ -422,23 +639,20 @@ plt.show()
 print("Saved: correlation_heatmap.png")
 
 # ─────────────────────────────────────────────────────────────────────
-# EDA PLOT 4 — Bid-ask spread feature analysis
+# EDA PLOT 5 — Bid-ask spread features
 # ─────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 fig.patch.set_facecolor(C_BG)
 fig.suptitle("Bid-Ask Spread Covariate Analysis  (30-sec buckets)",
              fontsize=13, fontweight="bold", color=C_BLUE)
 
-axes[0].scatter(eda_sample["rel_spread"], eda_sample["rv"],
-                alpha=0.1, s=3, color=C_PURPLE)
+axes[0].scatter(eda_sample["rel_spread"], eda_sample["rv"], alpha=0.1, s=3, color=C_PURPLE)
 axes[0].set_title("Relative Spread vs RV"); axes[0].set_xlabel("rel_spread"); axes[0].set_ylabel("rv")
 
-axes[1].scatter(eda_sample["bas_change"], eda_sample["rv"],
-                alpha=0.1, s=3, color=C_ORANGE)
+axes[1].scatter(eda_sample["bas_change"], eda_sample["rv"], alpha=0.1, s=3, color=C_ORANGE)
 axes[1].set_title("Spread Change vs RV"); axes[1].set_xlabel("bas_change"); axes[1].set_ylabel("rv")
 
-axes[2].scatter(eda_sample["spread_vol_interaction"], eda_sample["rv"],
-                alpha=0.1, s=3, color=C_GREEN)
+axes[2].scatter(eda_sample["spread_vol_interaction"], eda_sample["rv"], alpha=0.1, s=3, color=C_GREEN)
 axes[2].set_title("Spread × Lagged Vol vs RV"); axes[2].set_xlabel("spread_vol_interaction"); axes[2].set_ylabel("rv")
 
 plt.tight_layout()
@@ -447,23 +661,20 @@ plt.show()
 print("Saved: spread_features_eda.png")
 
 # ─────────────────────────────────────────────────────────────────────
-# EDA PLOT 5 — Order-flow proxy & volume analysis
+# EDA PLOT 6 — Order-flow proxy & volume analysis
 # ─────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 fig.patch.set_facecolor(C_BG)
 fig.suptitle("Order-Flow Proxy & Activity Analysis  (30-sec buckets)",
              fontsize=13, fontweight="bold", color=C_BLUE)
 
-axes[0].scatter(eda_sample["inv_spread"], eda_sample["rv"],
-                alpha=0.1, s=3, color=C_PURPLE)
+axes[0].scatter(eda_sample["inv_spread"], eda_sample["rv"], alpha=0.1, s=3, color=C_PURPLE)
 axes[0].set_title("Inv Spread (order proxy) vs RV"); axes[0].set_xlabel("inv_spread"); axes[0].set_ylabel("rv")
 
-axes[1].scatter(eda_sample["log_activity"], eda_sample["rv"],
-                alpha=0.1, s=3, color=C_GREEN)
+axes[1].scatter(eda_sample["log_activity"], eda_sample["rv"], alpha=0.1, s=3, color=C_GREEN)
 axes[1].set_title("log(Activity Proxy) vs RV"); axes[1].set_xlabel("log_activity"); axes[1].set_ylabel("rv")
 
-axes[2].scatter(eda_sample["volume_surge"], eda_sample["rv"],
-                alpha=0.1, s=3, color=C_GOLD)
+axes[2].scatter(eda_sample["volume_surge"], eda_sample["rv"], alpha=0.1, s=3, color=C_GOLD)
 axes[2].set_title("Volume Surge Ratio vs RV"); axes[2].set_xlabel("volume_surge"); axes[2].set_ylabel("rv")
 
 plt.tight_layout()
@@ -472,13 +683,12 @@ plt.show()
 print("Saved: order_flow_features_eda.png")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 5 — VOLATILITY CLUSTERING & MARKET REGIMES  → cluster_plots.png
+# SECTION 6 — VOLATILITY CLUSTERING & MARKET REGIMES
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 5 — VOLATILITY CLUSTERING & MARKET REGIMES  →  cluster_plots.png")
+print("SECTION 6 — VOLATILITY CLUSTERING & MARKET REGIMES  →  cluster_plots.png")
 print("=" * 70)
 
-# Three regimes based on global RV quantiles
 q33 = train["rv"].quantile(0.33)
 q66 = train["rv"].quantile(0.66)
 print(f"  Regime thresholds:  Low < {q33:.6f}  ≤  Med < {q66:.6f}  ≤  High")
@@ -494,7 +704,6 @@ test["regime"]  = test["rv"].apply(classify_regime)
 REG_COLORS = {0: C_GREEN, 1: C_GOLD, 2: C_ORANGE}
 REG_LABELS = {0: "Low Vol", 1: "Med Vol", 2: "High Vol"}
 
-# Pick illustrative stock × time_id
 sample_stock = train["stock_id"].value_counts().idxmax()
 sample_tids  = train[train["stock_id"] == sample_stock]["time_id"].unique()
 sample_tid   = sample_tids[len(sample_tids) // 2]
@@ -512,15 +721,13 @@ fig.suptitle(
 )
 gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.5, wspace=0.38)
 
-# ── Panel A: Time-series with regime shading ─────────────────────────
 ax_ts = fig.add_subplot(gs[0, :])
 for _, row in sample_ts.iterrows():
     ax_ts.axvspan(row["time_bucket"] - 0.5, row["time_bucket"] + 0.5,
                   color=REG_COLORS[row["regime"]], alpha=0.28, linewidth=0)
 ax_ts.plot(sample_ts["time_bucket"], sample_ts["rv"],
            color=C_BLUE, linewidth=1.8, zorder=3, label="RV")
-ax_ts.fill_between(sample_ts["time_bucket"], sample_ts["rv"],
-                   alpha=0.12, color=C_BLUE)
+ax_ts.fill_between(sample_ts["time_bucket"], sample_ts["rv"], alpha=0.12, color=C_BLUE)
 ax_ts.axhline(q33, color=C_GREEN,  linestyle="--", linewidth=0.9, alpha=0.8, label=f"q33={q33:.5f}")
 ax_ts.axhline(q66, color=C_ORANGE, linestyle="--", linewidth=0.9, alpha=0.8, label=f"q66={q66:.5f}")
 ax_ts.set_title(
@@ -534,7 +741,6 @@ regime_patches = [mpatches.Patch(color=REG_COLORS[r], alpha=0.6, label=REG_LABEL
 ax_ts.legend(handles=regime_patches + ax_ts.get_legend_handles_labels()[0][1:],
              loc="upper right", fontsize=8)
 
-# ── Panel B: Regime distribution ─────────────────────────────────────
 ax_reg = fig.add_subplot(gs[1, 0])
 counts = train["regime"].value_counts().sort_index()
 ax_reg.bar([REG_LABELS[r] for r in counts.index], counts.values,
@@ -542,7 +748,6 @@ ax_reg.bar([REG_LABELS[r] for r in counts.index], counts.values,
 ax_reg.set_title("Regime Distribution\n(all stocks, train set)", fontsize=9, color=C_GREY)
 ax_reg.set_ylabel("Row count")
 
-# ── Panel C: Mean BAS by regime  (spread widens in high-vol) ─────────
 ax_bas = fig.add_subplot(gs[1, 1])
 bas_reg = train.groupby("regime")["bas"].mean()
 ax_bas.bar([REG_LABELS[r] for r in bas_reg.index], bas_reg.values,
@@ -550,7 +755,6 @@ ax_bas.bar([REG_LABELS[r] for r in bas_reg.index], bas_reg.values,
 ax_bas.set_title("Mean Bid-Ask Spread by Regime\n(wider spread → higher vol)", fontsize=9, color=C_GREY)
 ax_bas.set_ylabel("Mean BAS")
 
-# ── Panel D: Mean activity proxy by regime ────────────────────────────
 ax_act = fig.add_subplot(gs[1, 2])
 act_reg = train.groupby("regime")["log_activity"].mean()
 ax_act.bar([REG_LABELS[r] for r in act_reg.index], act_reg.values,
@@ -558,7 +762,6 @@ ax_act.bar([REG_LABELS[r] for r in act_reg.index], act_reg.values,
 ax_act.set_title("Mean log(Activity) by Regime\n(activity proxy for order flow)", fontsize=9, color=C_GREY)
 ax_act.set_ylabel("Mean log_activity")
 
-# ── Panel E: Cross-stock regime fraction heatmap ──────────────────────
 ax_heat = fig.add_subplot(gs[2, :2])
 top_stocks = train["stock_id"].value_counts().head(20).index
 heat_df = (
@@ -568,7 +771,7 @@ heat_df = (
     .rename(columns=REG_LABELS)
 )
 heat_pct = heat_df.div(heat_df.sum(axis=1), axis=0)
-cmap_reg = LinearSegmentedColormap.from_list("regime", [C_GREEN, C_GOLD, C_ORANGE])
+cmap_reg  = LinearSegmentedColormap.from_list("regime", [C_GREEN, C_GOLD, C_ORANGE])
 sns.heatmap(heat_pct, ax=ax_heat, cmap=cmap_reg,
             annot=True, fmt=".2f", linewidths=0.3,
             annot_kws={"size": 7}, vmin=0, vmax=1,
@@ -577,7 +780,6 @@ ax_heat.set_title("Fraction of Time in Each Regime per Stock\n(cross-sectional d
                   fontsize=9, color=C_GREY)
 ax_heat.set_xlabel(""); ax_heat.set_ylabel("stock_id")
 
-# ── Panel F: RV autocorrelation (persistence justification) ──────────
 ax_acf = fig.add_subplot(gs[2, 2])
 rv_series = (
     train[train["stock_id"] == sample_stock]
@@ -607,41 +809,21 @@ plt.show()
 print("Saved: cluster_plots.png  ✓")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 6 — COVARIATE FINAL SET
+# SECTION 7 — COVARIATE FINAL SET
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 6 — COVARIATE FINAL SET")
+print("SECTION 7 — COVARIATE FINAL SET")
 print("=" * 70)
 
 FINAL_FEATURES = [
-    # ── RV persistence ────────────────────────────────────────────
-    "rv_lag1",               # strongest signal; volatility clusters over 30-s windows
-    "rv_lag2",               # secondary persistence
-    "rv_roll_mean",          # rolling mean: trend component
-    "rv_roll_sd",            # rolling SD: vol-of-vol
-    "rv_roll_cv",            # coefficient of variation (relative dispersion)
-    # ── Bid-ask spread ────────────────────────────────────────────
-    "bas",                   # raw spread level (liquidity cost)
-    "rel_spread",            # BAS / WAP: price-normalised spread
-    "bas_change",            # spread dynamics (widening/tightening)
-    "bas_roll_mean",         # rolling spread baseline
-    # ── Price covariates ──────────────────────────────────────────
-    "wap_return",            # log price momentum (30-s return)
-    "wap_dev",               # deviation from rolling WAP mean
-    # ── Order-flow proxies ────────────────────────────────────────
-    "inv_spread",            # inverse spread ≈ num-orders proxy
-    "log_activity",          # log(WAP × inv_spread): activity proxy
-    "volume_surge",          # relative activity spike
-    # ── Interaction terms ─────────────────────────────────────────
-    "spread_vol_interaction",# spread level × lagged vol
-    "rel_spread_vol",        # normalised spread × lagged vol
-    "activity_vol",          # order-activity × lagged vol
-    # ── Nonlinear ─────────────────────────────────────────────────
-    "rv_lag1_sq",            # squared lag (ARCH-like nonlinearity)
+    "rv_lag1", "rv_lag2", "rv_roll_mean", "rv_roll_sd", "rv_roll_cv",
+    "bas", "rel_spread", "bas_change", "bas_roll_mean",
+    "wap_return", "wap_dev",
+    "inv_spread", "log_activity", "volume_surge",
+    "spread_vol_interaction", "rel_spread_vol", "activity_vol",
+    "rv_lag1_sq",
 ]
 
-print(f"\n{'Feature':<30} {'r with RV':>10}  Group")
-print("─" * 62)
 GROUP_MAP = {
     "rv_lag1": "RV persistence",   "rv_lag2": "RV persistence",
     "rv_roll_mean": "RV persistence", "rv_roll_sd": "RV persistence",
@@ -655,13 +837,16 @@ GROUP_MAP = {
     "activity_vol": "Interaction",
     "rv_lag1_sq": "Nonlinear",
 }
+
+print(f"\n{'Feature':<30} {'r with RV':>10}  Group")
+print("─" * 62)
 for f in FINAL_FEATURES:
     r = rv_corrs.get(f, np.nan)
     print(f"  {f:<28} {r:>+10.4f}  {GROUP_MAP.get(f, '')}")
 print(f"\nTotal final features: {len(FINAL_FEATURES)}")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 7 — PREPARE MATRICES
+# SECTION 8 — PREPARE MATRICES
 # ═════════════════════════════════════════════════════════════════════
 train_clean = train.dropna(subset=FINAL_FEATURES + [TARGET])
 test_clean  = test.dropna(subset=FINAL_FEATURES + [TARGET])
@@ -670,17 +855,14 @@ X_train     = train_clean[FINAL_FEATURES].values
 y_train     = train_clean[TARGET].values
 X_test      = test_clean[FINAL_FEATURES].values
 y_test      = test_clean[TARGET].values
-bucket_vals = train_clean["time_bucket"].values   # used for WLS weights
+bucket_vals = train_clean["time_bucket"].values
 
 print(f"\nClean train: {len(train_clean):,}   Clean val: {len(test_clean):,}")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 8 — LOSS FUNCTIONS
+# SECTION 9 — LOSS FUNCTIONS
 # ═════════════════════════════════════════════════════════════════════
 def qlike(y, yhat):
-    """QLIKE: standard loss for volatility forecast evaluation.
-    Rewards forecasts that are both close and correctly sized.
-    """
     yhat = np.maximum(yhat, 1e-8)
     return float(np.mean(np.log(yhat) + y / yhat))
 
@@ -688,10 +870,10 @@ def mse(y, yhat):  return float(np.mean((y - yhat) ** 2))
 def mae(y, yhat):  return float(np.mean(np.abs(y - yhat)))
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 9 — OLS BASELINE
+# SECTION 10 — OLS BASELINE
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 9 — OLS BASELINE")
+print("SECTION 10 — OLS BASELINE")
 print("=" * 70)
 
 ols      = LinearRegression().fit(X_train, y_train)
@@ -701,37 +883,11 @@ print(f"OLS MSE:   {mse(y_test, ols_pred):.8f}")
 print(f"OLS MAE:   {mae(y_test, ols_pred):.8f}")
 print(f"OLS QLIKE: {qlike(y_test, ols_pred):.6f}")
 
-coef_ols_df = pd.DataFrame({
-    "feature":     FINAL_FEATURES,
-    "coefficient": ols.coef_,
-}).assign(abs_coef=lambda d: d["coefficient"].abs()) \
-  .sort_values("abs_coef", ascending=False)
-print("\nOLS Coefficients:")
-print(coef_ols_df[["feature", "coefficient"]].to_string(index=False))
-
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 10 — ALPHA TUNING  (WLS decay parameter grid search)
+# SECTION 11 — ALPHA TUNING  (WLS decay parameter grid search)
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 10 — ALPHA TUNING  (WLS exponential-decay weight)")
-print()
-print("  WLS WEIGHT FORMULA:")
-print("  ─────────────────────────────────────────────────────────────")
-print("  w(t) = α^(T − t)")
-print()
-print("  where  t = time_bucket index of observation (1 … T)")
-print("         T = last training bucket")
-print("         α ∈ (0, 1] = decay parameter")
-print()
-print("  Interpretation for traders:")
-print("  ─────────────────────────────────────────────────────────────")
-print("  OLS treats a 30-second window from 3 hours ago identically")
-print("  to a window from 30 seconds ago.  For intra-day vol that is")
-print("  wrong — market conditions shift.  WLS fixes this by assigning")
-print("  exponentially higher weight to more recent buckets.")
-print("  α = 0.99 → gentle decay (long memory)")
-print("  α = 0.80 → fast decay  (only the last few minutes matter)")
-print("  We select α by minimising out-of-sample QLIKE on the val set.")
+print("SECTION 11 — ALPHA TUNING  (WLS exponential-decay weight)")
 print("=" * 70)
 
 alpha_grid = np.round(np.arange(0.05, 1.00, 0.01), 3)
@@ -756,7 +912,6 @@ best_row   = tune_df.loc[tune_df["qlike"].idxmin()]
 best_alpha = float(best_row["alpha"])
 print(f"\nBest α = {best_alpha:.2f}  |  Val QLIKE = {best_row['qlike']:.6f}")
 
-# ── Alpha tuning plot ─────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(20, 5))
 fig.patch.set_facecolor(C_BG)
 fig.suptitle(
@@ -772,18 +927,17 @@ for ax, metric, color in zip(axes, ["qlike", "mse", "mae"],
                label=f"Best α={best_alpha:.2f}\n{metric.upper()}={best_val:.6f}")
     ax.set_title(f"{metric.upper()} vs α")
     ax.set_xlabel("Alpha (decay parameter)"); ax.set_ylabel(metric.upper())
-    ax.legend(fontsize=8)
-    ax.set_facecolor(C_BG)
+    ax.legend(fontsize=8); ax.set_facecolor(C_BG)
 plt.tight_layout()
 plt.savefig(OUT + "alpha_tuning.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("Saved: alpha_tuning.png")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 11 — FIT FINAL WLS MODEL
+# SECTION 12 — FINAL WLS MODEL
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 11 — FINAL WLS MODEL")
+print("SECTION 12 — FINAL WLS MODEL")
 print("=" * 70)
 
 best_weights = best_alpha ** (train_max_bucket - bucket_vals)
@@ -796,13 +950,9 @@ wls_coef_df = pd.DataFrame({
     "wls_coefficient": wls.coef_,
     "delta":           wls.coef_ - ols.coef_,
 }).sort_values("wls_coefficient", key=abs, ascending=False)
-
-print("\nOLS vs WLS Coefficients (sorted by |WLS coef|):")
+print("\nOLS vs WLS Coefficients:")
 print(wls_coef_df.to_string(index=False))
 
-# ─────────────────────────────────────────────────────────────────────
-# STANDALONE COEFFICIENT PLOT  (clearly labelled for report)
-# ─────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 fig.patch.set_facecolor(C_BG)
 fig.suptitle(
@@ -810,53 +960,43 @@ fig.suptitle(
     "We weight recent 30-second buckets more — old market conditions matter less",
     fontsize=12, fontweight="bold", color=C_BLUE
 )
-
 n_feat = len(FINAL_FEATURES)
 y_pos  = np.arange(n_feat)
 feat_sorted = wls_coef_df["feature"].values
-
-# Panel A: OLS vs WLS side-by-side
-axes[0].set_facecolor(C_BG)
 w = 0.38
+axes[0].set_facecolor(C_BG)
 axes[0].barh(y_pos - w/2, wls_coef_df["ols_coefficient"].values,
              height=w, label="OLS (equal weights)", color=C_BLUE, alpha=0.75, edgecolor="none")
 axes[0].barh(y_pos + w/2, wls_coef_df["wls_coefficient"].values,
-             height=w, label=f"WLS (α={best_alpha:.2f}, recent data weighted more)",
+             height=w, label=f"WLS (α={best_alpha:.2f})",
              color=C_ORANGE, alpha=0.75, edgecolor="none")
-axes[0].set_yticks(y_pos)
-axes[0].set_yticklabels(feat_sorted, fontsize=8)
+axes[0].set_yticks(y_pos); axes[0].set_yticklabels(feat_sorted, fontsize=8)
 axes[0].axvline(0, color=C_GREY, linewidth=0.8)
 axes[0].set_title("OLS vs WLS Coefficients", fontsize=11, color=C_BLUE)
-axes[0].set_xlabel("Coefficient value")
-axes[0].legend(fontsize=9)
-axes[0].invert_yaxis()
+axes[0].set_xlabel("Coefficient value"); axes[0].legend(fontsize=9); axes[0].invert_yaxis()
 
-# Panel B: Delta (WLS − OLS) — shows how recency changes each coefficient
 delta_colors = [C_ORANGE if v > 0 else C_BLUE for v in wls_coef_df["delta"].values]
 axes[1].set_facecolor(C_BG)
 axes[1].barh(y_pos, wls_coef_df["delta"].values,
              height=0.6, color=delta_colors, alpha=0.80, edgecolor="none")
-axes[1].set_yticks(y_pos)
-axes[1].set_yticklabels(feat_sorted, fontsize=8)
+axes[1].set_yticks(y_pos); axes[1].set_yticklabels(feat_sorted, fontsize=8)
 axes[1].axvline(0, color=C_GREY, linewidth=0.8)
-axes[1].set_title("Δ Coefficient  (WLS − OLS)\nHow much does down-weighting old data change each signal?",
+axes[1].set_title("Δ Coefficient  (WLS − OLS)\nHow does down-weighting old data shift each signal?",
                   fontsize=10, color=C_BLUE)
-axes[1].set_xlabel("WLS coef − OLS coef")
-axes[1].invert_yaxis()
+axes[1].set_xlabel("WLS coef − OLS coef"); axes[1].invert_yaxis()
 pos_patch = mpatches.Patch(color=C_ORANGE, label="WLS assigns larger coefficient")
 neg_patch = mpatches.Patch(color=C_BLUE,   label="WLS assigns smaller coefficient")
 axes[1].legend(handles=[pos_patch, neg_patch], fontsize=9)
-
 plt.tight_layout()
 plt.savefig(OUT + "wls_coefficient_plot.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("Saved: wls_coefficient_plot.png")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 12 — OLS vs WLS COMPARISON
+# SECTION 13 — OLS vs WLS COMPARISON (OVERALL)
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 12 — OLS vs WLS COMPARISON")
+print("SECTION 13 — OLS vs WLS COMPARISON")
 print("=" * 70)
 
 results = pd.DataFrame({
@@ -866,18 +1006,136 @@ results = pd.DataFrame({
     "QLIKE": [qlike(y_test, ols_pred), qlike(y_test, wls_pred)],
 })
 print(results.to_string(index=False))
-print()
 for metric in ["MSE", "MAE", "QLIKE"]:
-    ols_v = results.loc[0, metric]
-    wls_v = results.loc[1, metric]
+    ols_v = results.loc[0, metric]; wls_v = results.loc[1, metric]
     pct   = (ols_v - wls_v) / ols_v * 100
     direction = "improvement" if pct > 0 else "degradation"
     print(f"  {metric}: WLS {direction} over OLS = {pct:+.3f}%")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 13 — DIAGNOSTIC PLOTS
+# SECTION 14 — PER-STOCK EVALUATION  (NEW — for cross-model comparison)
 # ═════════════════════════════════════════════════════════════════════
-idx = np.random.choice(len(y_test), min(10_000, len(y_test)), replace=False)
+# Per team feedback: "Evaluate performance on different stocks, not just
+# periods of time."
+# Gia's GARCH outputs will be joined to this on (stock_id) so the team
+# can see exactly where GARCH blew up and cross-reference with liquidity.
+# ═════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("SECTION 14 — PER-STOCK EVALUATION  (for cross-model comparison)")
+print("=" * 70)
+
+test_eval = test_clean.copy()
+test_eval["ols_pred"] = ols_pred
+test_eval["wls_pred"] = wls_pred
+test_eval["wls_residual"] = y_test - wls_pred
+
+# Merge in bucket-level liquidity label
+test_eval = test_eval.merge(
+    test[["stock_id", "time_id", "time_bucket", "bucket_liquidity"]],
+    on=["stock_id", "time_id", "time_bucket"],
+    how="left"
+)
+# Merge in stock-level regime
+test_eval = test_eval.merge(
+    stock_liquidity[["stock_id", "stock_regime", "recommended_model",
+                     "median_bas", "median_log_activity",
+                     "liquid_pct", "illiquid_pct"]],
+    on="stock_id", how="left"
+)
+
+def stock_metrics(grp):
+    y    = grp[TARGET].values
+    yhat = grp["wls_pred"].values
+    return pd.Series({
+        "n_obs":         len(grp),
+        "wls_qlike":     qlike(y, yhat),
+        "wls_mse":       mse(y, yhat),
+        "wls_mae":       mae(y, yhat),
+        "ols_qlike":     qlike(y, grp["ols_pred"].values),
+        "mean_rv":       float(np.mean(y)),
+        "mean_bas":      float(grp["bas"].mean()),
+        "stock_regime":  grp["stock_regime"].iloc[0],
+        "recommended_model": grp["recommended_model"].iloc[0],
+        "liquid_pct":    float(grp["liquid_pct"].iloc[0]),
+        "illiquid_pct":  float(grp["illiquid_pct"].iloc[0]),
+    })
+
+per_stock_eval = (
+    test_eval.groupby("stock_id")
+    .apply(stock_metrics)
+    .reset_index()
+    .sort_values("wls_qlike")
+)
+print(f"\nPer-stock WLS evaluation (top 20 by QLIKE):")
+print(per_stock_eval[[
+    "stock_id", "stock_regime", "recommended_model",
+    "wls_qlike", "ols_qlike", "wls_mse", "n_obs", "mean_bas"
+]].head(20).to_string(index=False))
+
+# ─────────────────────────────────────────────────────────────────────
+# PER-STOCK PLOT — QLIKE by stock, grouped by liquidity regime
+# ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+fig.patch.set_facecolor(C_BG)
+fig.suptitle(
+    "Per-Stock WLS Performance by Liquidity Regime\n"
+    "Cross-reference with GARCH blow-up stocks (Jisu) on stock_id",
+    fontsize=12, fontweight="bold", color=C_BLUE
+)
+
+# Sort by QLIKE, colour by regime
+sorted_df = per_stock_eval.sort_values("wls_qlike")
+bar_clrs  = [STOCK_COLORS.get(r, C_GREY) for r in sorted_df["stock_regime"]]
+
+axes[0].set_facecolor(C_BG)
+axes[0].bar(range(len(sorted_df)), sorted_df["wls_qlike"].values,
+            color=bar_clrs, alpha=0.80, edgecolor="none", width=1.0)
+axes[0].set_title("WLS QLIKE per Stock\n(coloured by liquidity regime)",
+                  fontsize=10, color=C_GREY)
+axes[0].set_xlabel("Stock rank (sorted by QLIKE)"); axes[0].set_ylabel("QLIKE")
+legend_items = [mpatches.Patch(color=STOCK_COLORS[r], label=f"{r} stocks")
+                for r in ["liquid", "mixed", "illiquid"]]
+axes[0].legend(handles=legend_items, fontsize=9)
+
+# WLS vs OLS QLIKE scatter per stock
+axes[1].set_facecolor(C_BG)
+for regime, color in STOCK_COLORS.items():
+    sub = per_stock_eval[per_stock_eval["stock_regime"] == regime]
+    axes[1].scatter(sub["ols_qlike"], sub["wls_qlike"],
+                    color=color, alpha=0.75, s=40, edgecolors="white",
+                    linewidths=0.4, label=f"{regime}")
+maxq = max(per_stock_eval["ols_qlike"].max(), per_stock_eval["wls_qlike"].max())
+axes[1].plot([0, maxq], [0, maxq], "k--", linewidth=1, label="OLS = WLS")
+axes[1].set_title("OLS vs WLS QLIKE per Stock\n(below diagonal = WLS better)",
+                  fontsize=10, color=C_GREY)
+axes[1].set_xlabel("OLS QLIKE"); axes[1].set_ylabel("WLS QLIKE")
+axes[1].legend(fontsize=9)
+
+plt.tight_layout()
+plt.savefig(OUT + "per_stock_wls_performance.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved: per_stock_wls_performance.png  ✓")
+
+# ─────────────────────────────────────────────────────────────────────
+# PER-LIQUIDITY-REGIME QLIKE COMPARISON  (liquid vs illiquid)
+# Proves WLS is stable where EGARCH-X blows up
+# ─────────────────────────────────────────────────────────────────────
+print("\n  WLS performance by stock liquidity regime:")
+for regime in ["liquid", "mixed", "illiquid"]:
+    sub = per_stock_eval[per_stock_eval["stock_regime"] == regime]
+    if len(sub) == 0:
+        continue
+    print(f"    {regime:<10}: n_stocks={len(sub):3d}  "
+          f"median QLIKE={sub['wls_qlike'].median():.6f}  "
+          f"mean QLIKE={sub['wls_qlike'].mean():.6f}")
+
+print("\n  → WLS QLIKE should be stable across regimes "
+      "(unlike EGARCH-X which diverges in illiquid regime)")
+
+# ═════════════════════════════════════════════════════════════════════
+# SECTION 15 — DIAGNOSTIC PLOTS
+# ═════════════════════════════════════════════════════════════════════
+idx   = np.random.choice(len(y_test), min(10_000, len(y_test)), replace=False)
 y_s   = y_test[idx]
 ols_s = ols_pred[idx]
 wls_s = wls_pred[idx]
@@ -891,12 +1149,9 @@ fig.suptitle(
     fontsize=12, fontweight="bold", color=C_BLUE
 )
 
-# Predicted vs Actual
 for ax, pred, label, color in zip(
-    [axes[0, 0], axes[0, 1]],
-    [ols_s, wls_s],
-    ["OLS", f"WLS (α={best_alpha:.2f})"],
-    [C_BLUE, C_ORANGE]
+    [axes[0, 0], axes[0, 1]], [ols_s, wls_s],
+    ["OLS", f"WLS (α={best_alpha:.2f})"], [C_BLUE, C_ORANGE]
 ):
     ax.set_facecolor(C_BG)
     ax.scatter(y_s, pred, alpha=0.15, s=3, color=color)
@@ -906,42 +1161,27 @@ for ax, pred, label, color in zip(
     ax.set_xlabel("Actual RV"); ax.set_ylabel("Predicted RV")
     ax.legend(fontsize=8)
 
-# Residuals
 for ax, resid, label, color in zip(
     [axes[1, 0], axes[1, 1]],
     [y_s - ols_s, y_s - wls_s],
-    ["OLS", f"WLS (α={best_alpha:.2f})"],
-    [C_BLUE, C_ORANGE]
+    ["OLS", f"WLS (α={best_alpha:.2f})"], [C_BLUE, C_ORANGE]
 ):
-    ax.set_facecolor(C_BG)
-    ax.hist(resid, bins=80, color=color, alpha=0.75, edgecolor="none")
+    ax.set_facecolor(C_BG); ax.hist(resid, bins=80, color=color, alpha=0.75, edgecolor="none")
     ax.axvline(0, color="black", linestyle="--", linewidth=1)
     ax.set_title(f"{label}: Residual Distribution")
     ax.set_xlabel("Residual"); ax.set_ylabel("Count")
 
-# WLS weight visualisation
-ax_w = axes[0, 2]
-ax_w.set_facecolor(C_BG)
-t_vals = np.array(sorted_buckets[:n_train])
-w_vals = best_alpha ** (train_max_bucket - t_vals)
+ax_w = axes[0, 2]; ax_w.set_facecolor(C_BG)
+t_vals = np.array(sorted_buckets[:n_train]); w_vals = best_alpha ** (train_max_bucket - t_vals)
 ax_w.bar(t_vals, w_vals, color=C_BLUE, alpha=0.75, edgecolor="none", width=0.8)
-ax_w.set_title(
-    f"WLS Training Weights  (α = {best_alpha:.2f})\n"
-    "Recent 30-sec buckets → higher weight\nOld buckets → down-weighted",
-    fontsize=9, color=C_GREY
-)
-ax_w.set_xlabel("Training bucket (30-sec windows, oldest → newest)")
-ax_w.set_ylabel(f"Weight = {best_alpha:.2f}^(T−t)")
+ax_w.set_title(f"WLS Training Weights  (α = {best_alpha:.2f})\nRecent buckets → higher weight",
+               fontsize=9, color=C_GREY)
+ax_w.set_xlabel("Training bucket"); ax_w.set_ylabel(f"Weight = {best_alpha:.2f}^(T−t)")
 ax_w.annotate("Most recent\nbucket (weight=1)", xy=(train_max_bucket, 1),
               xytext=(train_max_bucket - 4, 0.85),
               arrowprops=dict(arrowstyle="->", color=C_ORANGE), color=C_ORANGE, fontsize=8)
 
-# QLIKE per time bucket
-ax_q = axes[1, 2]
-ax_q.set_facecolor(C_BG)
-test_eval = test_clean.copy()
-test_eval["ols_pred"] = ols_pred
-test_eval["wls_pred"] = wls_pred
+ax_q = axes[1, 2]; ax_q.set_facecolor(C_BG)
 bperf = test_eval.groupby("time_bucket").apply(
     lambda g: pd.Series({
         "ols_qlike": qlike(g[TARGET].values, g["ols_pred"].values),
@@ -962,34 +1202,52 @@ plt.show()
 print("Saved: ols_vs_wls_diagnostics.png")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 14 — SAVE  m2_wls_predictions.csv
-#   Required format: stock_id, time_id, actual_rv, predicted_rv
+# SECTION 16 — SAVE OUTPUTS
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
-print("SECTION 14 — SAVE  m2_wls_predictions.csv")
+print("SECTION 16 — SAVE OUTPUTS")
 print("=" * 70)
 
-predictions_df = test_clean[["stock_id", "time_id", "time_bucket"]].copy()
-predictions_df["actual_rv"]    = y_test
-predictions_df["predicted_rv"] = wls_pred
-predictions_df["residual"]     = y_test - wls_pred
-predictions_df["model"]        = f"WLS_alpha_{best_alpha:.2f}"
+# ── m2_wls_predictions.csv  (required format: stock_id, time_id, actual_rv, predicted_rv)
+#    NEW columns: bucket_liquidity, stock_regime → for Jisu cross-reference
+predictions_df = test_eval[[
+    "stock_id", "time_id", "time_bucket",
+    "actual_rv" if "actual_rv" in test_eval.columns else TARGET,
+    "wls_pred",
+    "wls_residual",
+    "bucket_liquidity",
+    "stock_regime",
+    "recommended_model",
+]].copy()
+# Ensure consistent column naming
+if TARGET in predictions_df.columns and "actual_rv" not in predictions_df.columns:
+    predictions_df = predictions_df.rename(columns={TARGET: "actual_rv"})
+predictions_df = predictions_df.rename(columns={"wls_pred": "predicted_rv"})
+predictions_df["model"] = f"WLS_alpha_{best_alpha:.2f}"
 
-out_path = OUT + "m2_wls_predictions.csv"
-predictions_df.to_csv(out_path, index=False)
-print(f"Saved : {out_path}")
-print(f"Shape : {predictions_df.shape}")
-print(predictions_df.head(10).to_string(index=False))
+out_pred = OUT + "m2_wls_predictions.csv"
+predictions_df.to_csv(out_pred, index=False)
+print(f"Saved : m2_wls_predictions.csv  ({predictions_df.shape})")
 
-# Quick sanity check
-assert "stock_id"     in predictions_df.columns
-assert "time_id"      in predictions_df.columns
-assert "actual_rv"    in predictions_df.columns
-assert "predicted_rv" in predictions_df.columns
-print("\n[CHECK] m2_wls_predictions.csv columns verified ✓")
+# ── m2_stock_liquidity_profile.csv  (already saved in Section 4)
+print(f"Saved : m2_stock_liquidity_profile.csv  ({stock_liquidity.shape})")
+
+# ── m2_per_stock_eval.csv  (NEW — for cross-model comparison with GARCH)
+per_stock_out = OUT + "m2_per_stock_eval.csv"
+per_stock_eval.to_csv(per_stock_out, index=False)
+print(f"Saved : m2_per_stock_eval.csv  ({per_stock_eval.shape})")
+
+# Quick sanity checks
+assert "stock_id"      in predictions_df.columns
+assert "time_id"       in predictions_df.columns
+assert "actual_rv"     in predictions_df.columns
+assert "predicted_rv"  in predictions_df.columns
+assert "bucket_liquidity" in predictions_df.columns
+assert "stock_regime"  in predictions_df.columns
+print("\n[CHECK] all output columns verified ✓")
 
 # ═════════════════════════════════════════════════════════════════════
-# SECTION 15 — FINAL SUMMARY
+# SECTION 17 — FINAL SUMMARY
 # ═════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
 print("FINAL SUMMARY")
@@ -1002,18 +1260,28 @@ print(f"30-second buckets per window: {N_EXPECTED_BUCKETS}")
 print(f"Train buckets               : {n_train}  (buckets 1–{train_max_bucket})")
 print(f"Val   buckets               : {n_val}  (buckets {train_max_bucket+1}–20)")
 print()
+print("Stock liquidity regime breakdown:")
+for r, c in regime_counts.items():
+    pct = 100 * c / len(stock_liquidity)
+    print(f"  {r:<10}: {c:>4} stocks ({pct:.1f}%) — "
+          f"{'→ EGARCH-X recommended' if r == 'liquid' else '→ WLS/HAR-RV recommended (stable fallback)'}")
+print()
 print("Files written:")
 for f in [
     "eda_distributions.png",
+    "liquidity_regime_eda.png",          # ← NEW: Jamie's primary new EDA
     "feature_selection_correlation.png",
     "correlation_heatmap.png",
     "spread_features_eda.png",
     "order_flow_features_eda.png",
-    "cluster_plots.png",              # ← required output
+    "cluster_plots.png",
     "alpha_tuning.png",
     "wls_coefficient_plot.png",
     "ols_vs_wls_diagnostics.png",
-    "m2_wls_predictions.csv",         # ← required output
+    "per_stock_wls_performance.png",     # ← NEW: per-stock evaluation
+    "m2_wls_predictions.csv",            # ← updated: + liquidity cols
+    "m2_stock_liquidity_profile.csv",    # ← NEW: for app + Jisu
+    "m2_per_stock_eval.csv",             # ← NEW: for cross-model comparison
 ]:
     print(f"  {OUT}{f}")
 print("\nDone.")
