@@ -1,0 +1,218 @@
+RANDOM_SEED        = 42          # fixed seed for full reproducibility
+N_DEMO_PER_REGIME  = 20          # 20 random stocks per regime (liquid/mixed/illiquid)
+N_TIME_IDS         = 300         # random subset of time_ids to keep (balances speed vs accuracy)
+N_CV_FOLDS         = 5           # number of folds for TimeSeriesSplit cross-validation
+
+# ─────────────────────────────────────────────────────────────────────
+# FEATURE SELECTION THRESHOLDS
+
+MIN_CORR_THRESHOLD    = 0.05
+COLLINEARITY_THRESHOLD = 0.95
+
+BUCKET_SECONDS     = 30
+WINDOW_SECONDS     = 600
+N_EXPECTED_BUCKETS = WINDOW_SECONDS // BUCKET_SECONDS
+TARGET = "rv"
+
+def train_val_split(df):
+    """80/20 holdout split on time_bucket order (used for final evaluation)."""
+    sorted_b  = sorted(df["time_bucket"].unique())
+    n_train   = int(len(sorted_b) * 0.8)
+    train_max = sorted_b[n_train - 1]
+    return (df[df["time_bucket"] <= train_max].copy(),
+            df[df["time_bucket"] >  train_max].copy(),
+            sorted_b, n_train, train_max)
+
+def label_bucket_liquidity(frame, bas_q33, bas_q66, act_q33, act_q66):
+    def _label(r):
+        if r["bas"] <= bas_q33 and r["log_activity"] >= act_q66: return "liquid"
+        if r["bas"] >= bas_q66 and r["log_activity"] <= act_q33: return "illiquid"
+        return "mixed"
+    frame["bucket_liquidity"] = frame.apply(_label, axis=1)
+    return frame
+
+def wls_cv_on_df(df_feat, features, target, n_splits=N_CV_FOLDS):
+    """
+    Time-series k-fold CV for WLS on a pre-featured DataFrame.
+
+    Strategy
+    --------
+    We split on *sorted time_bucket* values so that each fold always
+    trains on earlier buckets and validates on later ones — preserving
+    temporal order and preventing look-ahead leakage.
+
+    For each fold:
+      1. Find the best alpha via grid-search on that fold's train/val split.
+      2. Fit WLS with that alpha.
+      3. Record QLIKE, MSE, MAE on the fold's validation set.
+
+    Returns
+    -------
+    cv_results : list of dicts  (one per fold)
+    best_alpha : float           (alpha from the fold with best QLIKE)
+    """
+    df_clean  = df_feat.dropna(subset=features + [target]).copy()
+    sorted_b  = np.array(sorted(df_clean["time_bucket"].unique()))
+    n_buckets = len(sorted_b)
+
+    # TimeSeriesSplit works on bucket indices, not row indices
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    cv_results = []
+
+    for fold_idx, (tr_idx, te_idx) in enumerate(tss.split(sorted_b)):
+        tr_buckets = sorted_b[tr_idx]
+        te_buckets = sorted_b[te_idx]
+        tr_max     = tr_buckets[-1]
+
+        tr = df_clean[df_clean["time_bucket"].isin(tr_buckets)]
+        te = df_clean[df_clean["time_bucket"].isin(te_buckets)]
+
+        if len(tr) < 50 or len(te) < 10:
+            print(f"    [CV] Fold {fold_idx+1}: skipped (too few rows — tr={len(tr)}, te={len(te)})")
+            continue
+
+        X_tr = tr[features].values;  y_tr = tr[target].values
+        X_te = te[features].values;  y_te = te[target].values
+        bv   = tr["time_bucket"].values
+
+        # tune alpha on this fold
+        best_a, _ = tune_alpha(X_tr, y_tr, X_te, y_te, tr_max, bv)
+        w         = best_a ** (tr_max - bv)
+        wls       = LinearRegression().fit(X_tr, y_tr, sample_weight=w)
+        pred      = np.maximum(wls.predict(X_te), 1e-8)
+
+        # OLS baseline for comparison
+        ols  = LinearRegression().fit(X_tr, y_tr)
+        pred_ols = np.maximum(ols.predict(X_te), 1e-8)
+
+        fold_res = {
+            "fold":       fold_idx + 1,
+            "n_train":    len(tr),
+            "n_val":      len(te),
+            "tr_buckets": f"{tr_buckets[0]}–{tr_buckets[-1]}",
+            "val_buckets":f"{te_buckets[0]}–{te_buckets[-1]}",
+            "best_alpha": best_a,
+            "wls_qlike":  qlike(y_te, pred),
+            "wls_mse":    mse(y_te, pred),
+            "wls_mae":    mae(y_te, pred),
+            "ols_qlike":  qlike(y_te, pred_ols),
+        }
+        cv_results.append(fold_res)
+        print(f"    [CV] Fold {fold_idx+1}:  "
+              f"tr_buckets={fold_res['tr_buckets']}  val_buckets={fold_res['val_buckets']}  "
+              f"α={best_a:.2f}  WLS_QLIKE={fold_res['wls_qlike']:.6f}  "
+              f"OLS_QLIKE={fold_res['ols_qlike']:.6f}")
+
+    cv_df = pd.DataFrame(cv_results)
+    best_alpha_cv = (cv_df.loc[cv_df["wls_qlike"].idxmin(), "best_alpha"]
+                     if len(cv_df) > 0 else 0.99)
+    return cv_results, float(best_alpha_cv)
+
+
+def print_cv_summary(cv_results, label=""):
+    """Pretty-print mean ± std of CV metrics."""
+    if not cv_results:
+        print("  [CV] No results to summarise.")
+        return
+    cv_df = pd.DataFrame(cv_results)
+    print(f"\n  ── CV SUMMARY  {label} ──")
+    print(f"  {'Metric':<20} {'Mean':>10}  {'Std':>10}  {'Min':>10}  {'Max':>10}")
+    print("  " + "─" * 60)
+    for col in ["wls_qlike", "wls_mse", "wls_mae", "ols_qlike", "best_alpha"]:
+        print(f"  {col:<20} {cv_df[col].mean():>10.6f}  "
+              f"{cv_df[col].std():>10.6f}  "
+              f"{cv_df[col].min():>10.6f}  "
+              f"{cv_df[col].max():>10.6f}")
+    print(f"\n  Fold details:")
+    for _, r in cv_df.iterrows():
+        print(f"    Fold {int(r['fold'])}: "
+              f"train_buckets={r['tr_buckets']}  val_buckets={r['val_buckets']}  "
+              f"n_train={int(r['n_train'])}  n_val={int(r['n_val'])}  "
+              f"α={r['best_alpha']:.2f}  QLIKE={r['wls_qlike']:.6f}")
+
+
+def plot_cv_results(cv_results, title, save_path):
+    """Bar chart of per-fold WLS vs OLS QLIKE."""
+    if not cv_results:
+        return
+    cv_df = pd.DataFrame(cv_results)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.patch.set_facecolor(C_BG)
+    fig.suptitle(title, fontsize=12, fontweight="bold", color=C_BLUE)
+
+    x = np.arange(len(cv_df))
+    w = 0.35
+    axes[0].bar(x - w/2, cv_df["wls_qlike"], w, color=C_TEAL, alpha=0.82, label="WLS")
+    axes[0].bar(x + w/2, cv_df["ols_qlike"], w, color=C_ORANGE, alpha=0.82, label="OLS")
+    axes[0].axhline(cv_df["wls_qlike"].mean(), color=C_TEAL,   linestyle="--", lw=1.2,
+                    label=f"WLS mean={cv_df['wls_qlike'].mean():.4f}")
+    axes[0].axhline(cv_df["ols_qlike"].mean(), color=C_ORANGE, linestyle="--", lw=1.2,
+                    label=f"OLS mean={cv_df['ols_qlike'].mean():.4f}")
+    axes[0].set_xticks(x); axes[0].set_xticklabels([f"Fold {i+1}" for i in x])
+    axes[0].set_title("QLIKE per CV Fold"); axes[0].set_ylabel("QLIKE")
+    axes[0].legend(fontsize=8); axes[0].set_facecolor(C_BG)
+
+    axes[1].bar(x, cv_df["best_alpha"], color=C_BLUE, alpha=0.82, edgecolor="none")
+    axes[1].axhline(cv_df["best_alpha"].mean(), color=C_RED, linestyle="--", lw=1.2,
+                    label=f"Mean α={cv_df['best_alpha'].mean():.3f}")
+    axes[1].set_xticks(x); axes[1].set_xticklabels([f"Fold {i+1}" for i in x])
+    axes[1].set_title("Best α per CV Fold"); axes[1].set_ylabel("α")
+    axes[1].legend(fontsize=8); axes[1].set_facecolor(C_BG)
+    axes[1].set_ylim(0, 1.05)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight"); plt.show()
+    print(f"  Saved: {save_path}  ✓")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# LOAD FULL DATASET
+
+df_full = pd.read_csv(OUT + "optiver_aggregated.csv")
+df_full = df_full[df_full["time_bucket"] > 0].copy()
+df_full = df_full.rename(columns={
+    "WAP_mean": "wap", "BidAskSpread_mean": "bas", "volatility": "rv"})
+df_full = df_full.sort_values(["stock_id","time_id","time_bucket"]).reset_index(drop=True)
+print(f"  Full dataset (bucket-0 dropped): {df_full.shape}")
+print(f"  Unique stocks  : {df_full['stock_id'].nunique()}")
+print(f"  Unique time_ids: {df_full['time_id'].nunique()}")
+
+# ─────────────────────────────────────────────────────────────────────
+# RANDOM time_id SUBSAMPLE
+# Rationale: 300 time_ids gives ~300 × 20 buckets = 6,000 rows per stock,
+# which is large enough for stable CV estimates while keeping runtime
+# to a few minutes on a laptop. Seed is fixed so results are reproducible.
+# ─────────────────────────────────────────────────────────────────────
+all_time_ids = sorted(df_full["time_id"].unique())
+rng = np.random.default_rng(RANDOM_SEED)
+
+if len(all_time_ids) > N_TIME_IDS:
+    sampled_time_ids = sorted(rng.choice(all_time_ids, size=N_TIME_IDS, replace=False).tolist())
+    df_full = df_full[df_full["time_id"].isin(sampled_time_ids)].copy()
+    print(f"\n  ── TIME_ID SUBSAMPLE ──")
+    print(f"  Sampled {N_TIME_IDS} of {len(all_time_ids)} time_ids  (seed={RANDOM_SEED})")
+    print(f"  Sampled time_ids: {sampled_time_ids}")
+else:
+    sampled_time_ids = all_time_ids
+    print(f"  Using all {len(all_time_ids)} time_ids (fewer than requested {N_TIME_IDS})")
+
+print(f"  Dataset after time_id filter: {df_full.shape}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Jamie's WLS BASELINE + CV  (stock_id = 1 only)
+
+df1 = df_full[df_full["stock_id"] == 1].copy()
+print(f"  stock_id=1 rows: {len(df1):,}")
+
+train1, test1, sorted_b1, n_train1, train_max1 = train_val_split(df1)
+print(f"  Holdout split — Train buckets: 1–{train_max1}  |  Test buckets: {train_max1+1}–{sorted_b1[-1]}")
+print(f"  Train rows: {len(train1):,}   Test rows: {len(test1):,}")
+
+print("  Engineering features …")
+train1 = add_features(train1);  test1 = add_features(test1)
+
+bas_q33_1 = train1["bas"].quantile(0.33); bas_q66_1 = train1["bas"].quantile(0.66)
+act_q33_1 = train1["log_activity"].quantile(0.33); act_q66_1 = train1["log_activity"].quantile(0.66)
+train1 = label_bucket_liquidity(train1, bas_q33_1, bas_q66_1, act_q33_1, act_q66_1)
+test1  = label_bucket_liquidity(test1,  bas_q33_1, bas_q66_1, act_q33_1, act_q66_1)
