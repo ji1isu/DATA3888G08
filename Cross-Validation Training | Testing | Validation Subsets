@@ -1,0 +1,6 @@
+Fold details:
+    Fold 1: train_buckets=4–6  val_buckets=7–8  n_train=53918  n_val=35970  α=0.14  QLIKE=-1.282753
+    Fold 2: train_buckets=4–8  val_buckets=9–10  n_train=89888  n_val=35958  α=0.06  QLIKE=1.812762
+    Fold 3: train_buckets=4–10  val_buckets=11–12  n_train=125846  n_val=35965  α=0.42  QLIKE=0.518885
+    Fold 4: train_buckets=4–12  val_buckets=13–14  n_train=161811  n_val=35964  α=0.80  QLIKE=-0.132475
+    Fold 5: train_buckets=4–14  val_buckets=15–16  n_train=197775  n_val=35968  α=0.05  QLIKE=0.708474
