@@ -1,218 +1,293 @@
-RANDOM_SEED        = 42          # fixed seed for full reproducibility
-N_DEMO_PER_REGIME  = 20          # 20 random stocks per regime (liquid/mixed/illiquid)
-N_TIME_IDS         = 300         # random subset of time_ids to keep (balances speed vs accuracy)
-N_CV_FOLDS         = 5           # number of folds for TimeSeriesSplit cross-validation
+"""
+Shared Data Configuration — Optiver Volatility Forecasting
+===========================================================
+Generated from Member 2 (Jamie) WLS pipeline.
+Use this file to ensure HAR-RV, EGARCH-X, and WLS analyses
+all operate on exactly the same stocks, time_ids, and splits.
+
+ALL analysts must import from this file rather than re-deriving
+these values, to guarantee cross-model comparability.
+
+Usage
+-----
+    from shared_data_config import (
+        load_filtered_dataset,
+        LIQUID_STOCKS, MIXED_STOCKS, ILLIQUID_STOCKS, DEMO_STOCKS,
+        SAMPLED_TIME_IDS,
+        get_holdout_split, get_cv_folds,
+        REGIME_MAP, BUCKET_SECONDS, TARGET,
+    )
+"""
+
+import pandas as pd
+import numpy as np
 
 # ─────────────────────────────────────────────────────────────────────
-# FEATURE SELECTION THRESHOLDS
+# GLOBAL CONSTANTS
+# ─────────────────────────────────────────────────────────────────────
+RANDOM_SEED    = 42
+N_CV_FOLDS     = 5
+BUCKET_SECONDS = 30
+TARGET         = "rv"          # target column name after renaming
+HOLDOUT_RATIO  = 0.80          # 80% train / 20% test for holdout split
 
-MIN_CORR_THRESHOLD    = 0.05
-COLLINEARITY_THRESHOLD = 0.95
+# ─────────────────────────────────────────────────────────────────────
+# TIME_ID SUBSAMPLE
+# Derived by: np.random.default_rng(42).choice(all_3830_time_ids, 300, replace=False)
+# Full dataset had 3,830 unique time_ids across 112 stocks.
+# 300 were randomly sampled (seed=42) for computational tractability.
+# ─────────────────────────────────────────────────────────────────────
+SAMPLED_TIME_IDS = [
+    256, 650, 745, 748, 785, 1070, 1178, 1227, 1359, 1820, 1904, 2006,
+    2037, 2185, 2331, 2410, 2444, 2525, 2553, 2593, 2631, 2656, 2659,
+    2867, 2893, 2917, 3146, 3152, 3406, 3607, 3721, 3884, 3921, 4004,
+    4158, 4173, 4364, 4493, 4560, 4627, 4723, 4743, 4850, 4905, 5032,
+    5063, 5305, 5340, 5458, 5470, 5598, 5620, 5743, 5825, 5829, 5916,
+    6177, 6476, 6626, 6693, 6979, 7041, 7219, 7270, 8081, 8191, 8196,
+    8256, 8448, 8534, 8583, 8585, 8665, 8721, 8763, 9077, 9153, 9302,
+    9352, 9367, 9456, 9564, 9700, 9862, 9918, 10017, 10042, 10488,
+    10604, 10702, 10725, 10776, 10781, 10994, 11090, 11243, 11375,
+    11508, 11869, 11940, 12030, 12420, 12579, 12581, 12676, 12834,
+    12957, 12991, 13180, 13235, 13269, 13362, 13382, 13410, 13421,
+    13432, 13451, 13452, 13598, 13821, 13900, 13941, 13960, 13986,
+    14001, 14004, 14077, 14125, 14235, 14246, 14247, 14278, 14279,
+    14311, 14465, 14752, 14769, 14810, 14976, 15061, 15209, 15276,
+    15280, 15319, 15341, 15400, 15448, 15499, 15516, 15529, 15547,
+    16086, 16288, 16438, 16570, 16802, 16816, 16910, 17013, 17056,
+    17058, 17157, 17169, 17172, 17191, 17264, 17398, 17983, 18012,
+    18180, 18200, 18218, 18400, 18509, 18595, 18629, 18792, 18916,
+    19065, 19072, 19180, 19226, 19385, 19499, 19554, 19678, 19994,
+    20063, 20172, 20199, 20317, 20418, 20457, 20469, 20673, 20691,
+    20732, 20972, 21079, 21083, 21208, 21272, 21428, 21445, 21685,
+    21734, 22011, 22120, 22217, 22304, 22392, 22519, 22622, 22635,
+    22750, 22829, 23030, 23185, 23228, 23232, 23337, 23642, 23708,
+    23819, 23823, 23858, 23903, 24157, 24179, 24388, 24393, 24396,
+    24473, 24535, 24816, 24817, 25019, 25087, 25312, 25318, 25335,
+    25369, 25389, 25488, 25501, 25599, 25654, 25854, 26208, 26337,
+    26447, 26568, 26844, 27020, 27278, 27304, 27313, 27711, 27868,
+    28070, 28512, 28541, 28634, 28697, 29316, 29507, 29570, 29592,
+    29853, 30412, 30454, 30527, 30598, 30748, 30790, 30816, 30896,
+    31055, 31083, 31119, 31138, 31327, 31412, 31482, 31522, 31656,
+    32126, 32186, 32200, 32249, 32277, 32322, 32376, 32463, 32590,
+    32653, 32662, 32680, 32746, 32748,
+]
+assert len(SAMPLED_TIME_IDS) == 300, "Expected exactly 300 sampled time_ids"
 
-BUCKET_SECONDS     = 30
-WINDOW_SECONDS     = 600
-N_EXPECTED_BUCKETS = WINDOW_SECONDS // BUCKET_SECONDS
-TARGET = "rv"
+# ─────────────────────────────────────────────────────────────────────
+# STOCK SELECTIONS
+# Derived by Phase 2 liquidity classification:
+#   - stock_regime = "liquid"   if liquid_pct   >= 0.40
+#   - stock_regime = "illiquid" if illiquid_pct >= 0.40
+#   - stock_regime = "mixed"    otherwise
+# Then 20 random stocks sampled per regime (seeds 42 / 43 / 44).
+#
+# Universe counts (112 stocks total):
+#   liquid   : 39 stocks (34.8%)
+#   illiquid : 43 stocks (38.4%)
+#   mixed    : 30 stocks (26.8%)
+# ─────────────────────────────────────────────────────────────────────
+LIQUID_STOCKS = [
+    10, 13, 20, 28, 39, 46, 47, 50, 51, 52,
+    64, 68, 69, 77, 85, 86, 95, 99, 120, 124,
+]
+MIXED_STOCKS = [
+    7, 19, 21, 26, 32, 42, 48, 59, 61, 70,
+    73, 76, 82, 89, 96, 101, 107, 113, 114, 115,
+]
+ILLIQUID_STOCKS = [
+    0, 3, 4, 6, 9, 23, 30, 37, 38, 40,
+    60, 80, 81, 88, 97, 98, 102, 103, 112, 118,
+]
+DEMO_STOCKS = sorted(LIQUID_STOCKS + MIXED_STOCKS + ILLIQUID_STOCKS)
 
-def train_val_split(df):
-    """80/20 holdout split on time_bucket order (used for final evaluation)."""
-    sorted_b  = sorted(df["time_bucket"].unique())
-    n_train   = int(len(sorted_b) * 0.8)
-    train_max = sorted_b[n_train - 1]
-    return (df[df["time_bucket"] <= train_max].copy(),
-            df[df["time_bucket"] >  train_max].copy(),
-            sorted_b, n_train, train_max)
+# Convenience lookup: stock_id → regime string
+REGIME_MAP = (
+    {s: "liquid"   for s in LIQUID_STOCKS}
+  | {s: "mixed"    for s in MIXED_STOCKS}
+  | {s: "illiquid" for s in ILLIQUID_STOCKS}
+)
 
-def label_bucket_liquidity(frame, bas_q33, bas_q66, act_q33, act_q66):
-    def _label(r):
-        if r["bas"] <= bas_q33 and r["log_activity"] >= act_q66: return "liquid"
-        if r["bas"] >= bas_q66 and r["log_activity"] <= act_q33: return "illiquid"
-        return "mixed"
-    frame["bucket_liquidity"] = frame.apply(_label, axis=1)
-    return frame
+# Recommended model per regime (for labelling / routing only)
+MODEL_MAP = {
+    "liquid":   "EGARCH-X",
+    "mixed":    "WLS / HAR-RV",
+    "illiquid": "WLS / HAR-RV",
+}
 
-def wls_cv_on_df(df_feat, features, target, n_splits=N_CV_FOLDS):
+# ─────────────────────────────────────────────────────────────────────
+# TIME-BUCKET SPLIT DEFINITIONS
+#
+# All models use the same holdout and CV structure.
+# time_bucket ranges from 1–20 (each bucket = 30 seconds).
+# Bucket 0 is always dropped (pre-auction / incomplete).
+#
+# HOLDOUT SPLIT (80/20 on bucket order):
+#   train : time_bucket in [1, 2, ..., 16]   (buckets 1–16)
+#   test  : time_bucket in [17, 18, 19, 20]  (buckets 17–20)
+#
+# 5-FOLD TimeSeriesSplit (applied within training buckets 1–16):
+#   Fold 1 : train=4–6    val=7–8
+#   Fold 2 : train=4–8    val=9–10
+#   Fold 3 : train=4–10   val=11–12
+#   Fold 4 : train=4–12   val=13–14
+#   Fold 5 : train=4–14   val=15–16
+#
+# NOTE: TimeSeriesSplit always trains on strictly earlier buckets
+# than it validates on — no look-ahead leakage.
+# ─────────────────────────────────────────────────────────────────────
+ALL_BUCKETS        = list(range(1, 21))       # buckets 1–20
+TRAIN_BUCKETS      = list(range(1, 17))       # 1–16  (holdout train)
+TEST_BUCKETS       = list(range(17, 21))      # 17–20 (holdout test)
+TRAIN_BUCKET_MAX   = 16
+
+CV_FOLDS = [
+    # (fold_number, train_bucket_range, val_bucket_range)
+    (1, list(range(4,  7)),  list(range(7,  9))),   # train=4–6,   val=7–8
+    (2, list(range(4,  9)),  list(range(9,  11))),  # train=4–8,   val=9–10
+    (3, list(range(4,  11)), list(range(11, 13))),  # train=4–10,  val=11–12
+    (4, list(range(4,  13)), list(range(13, 15))),  # train=4–12,  val=13–14
+    (5, list(range(4,  15)), list(range(15, 17))),  # train=4–14,  val=15–16
+]
+
+# ─────────────────────────────────────────────────────────────────────
+# DATA LOADING HELPER
+# Call this at the top of any analysis script to get the
+# correctly filtered, renamed, sorted dataframe.
+# ─────────────────────────────────────────────────────────────────────
+def load_filtered_dataset(csv_path: str,
+                          stocks: list = None,
+                          verbose: bool = True) -> pd.DataFrame:
     """
-    Time-series k-fold CV for WLS on a pre-featured DataFrame.
+    Load optiver_aggregated.csv and apply all shared filters:
+      1. Drop time_bucket == 0
+      2. Rename columns to match WLS pipeline conventions
+      3. Filter to SAMPLED_TIME_IDS (the 300 sampled time_ids)
+      4. Optionally filter to a specific stock list (default: DEMO_STOCKS)
+      5. Sort by stock_id, time_id, time_bucket
 
-    Strategy
-    --------
-    We split on *sorted time_bucket* values so that each fold always
-    trains on earlier buckets and validates on later ones — preserving
-    temporal order and preventing look-ahead leakage.
-
-    For each fold:
-      1. Find the best alpha via grid-search on that fold's train/val split.
-      2. Fit WLS with that alpha.
-      3. Record QLIKE, MSE, MAE on the fold's validation set.
+    Parameters
+    ----------
+    csv_path : str
+        Path to optiver_aggregated.csv
+    stocks : list of int, optional
+        Stock IDs to keep. Defaults to DEMO_STOCKS (all 60 demo stocks).
+        Pass None to keep all 112 stocks (Phase 2 style).
+    verbose : bool
+        Print row/shape info if True.
 
     Returns
     -------
-    cv_results : list of dicts  (one per fold)
-    best_alpha : float           (alpha from the fold with best QLIKE)
+    pd.DataFrame with columns: stock_id, time_id, time_bucket, wap, bas, rv
     """
-    df_clean  = df_feat.dropna(subset=features + [target]).copy()
-    sorted_b  = np.array(sorted(df_clean["time_bucket"].unique()))
-    n_buckets = len(sorted_b)
+    df = pd.read_csv(csv_path)
+    df = df[df["time_bucket"] > 0].copy()
+    df = df.rename(columns={
+        "WAP_mean":         "wap",
+        "BidAskSpread_mean": "bas",
+        "volatility":        "rv",
+    })
+    df = df[df["time_id"].isin(SAMPLED_TIME_IDS)].copy()
 
-    # TimeSeriesSplit works on bucket indices, not row indices
-    tss = TimeSeriesSplit(n_splits=n_splits)
-    cv_results = []
+    if stocks is not None:
+        df = df[df["stock_id"].isin(stocks)].copy()
 
-    for fold_idx, (tr_idx, te_idx) in enumerate(tss.split(sorted_b)):
-        tr_buckets = sorted_b[tr_idx]
-        te_buckets = sorted_b[te_idx]
-        tr_max     = tr_buckets[-1]
+    df = df.sort_values(["stock_id", "time_id", "time_bucket"]).reset_index(drop=True)
 
-        tr = df_clean[df_clean["time_bucket"].isin(tr_buckets)]
-        te = df_clean[df_clean["time_bucket"].isin(te_buckets)]
+    if verbose:
+        print(f"  Loaded: {df.shape[0]:,} rows  |  "
+              f"{df['stock_id'].nunique()} stocks  |  "
+              f"{df['time_id'].nunique()} time_ids")
 
-        if len(tr) < 50 or len(te) < 10:
-            print(f"    [CV] Fold {fold_idx+1}: skipped (too few rows — tr={len(tr)}, te={len(te)})")
-            continue
+    return df
 
-        X_tr = tr[features].values;  y_tr = tr[target].values
-        X_te = te[features].values;  y_te = te[target].values
-        bv   = tr["time_bucket"].values
-
-        # tune alpha on this fold
-        best_a, _ = tune_alpha(X_tr, y_tr, X_te, y_te, tr_max, bv)
-        w         = best_a ** (tr_max - bv)
-        wls       = LinearRegression().fit(X_tr, y_tr, sample_weight=w)
-        pred      = np.maximum(wls.predict(X_te), 1e-8)
-
-        # OLS baseline for comparison
-        ols  = LinearRegression().fit(X_tr, y_tr)
-        pred_ols = np.maximum(ols.predict(X_te), 1e-8)
-
-        fold_res = {
-            "fold":       fold_idx + 1,
-            "n_train":    len(tr),
-            "n_val":      len(te),
-            "tr_buckets": f"{tr_buckets[0]}–{tr_buckets[-1]}",
-            "val_buckets":f"{te_buckets[0]}–{te_buckets[-1]}",
-            "best_alpha": best_a,
-            "wls_qlike":  qlike(y_te, pred),
-            "wls_mse":    mse(y_te, pred),
-            "wls_mae":    mae(y_te, pred),
-            "ols_qlike":  qlike(y_te, pred_ols),
-        }
-        cv_results.append(fold_res)
-        print(f"    [CV] Fold {fold_idx+1}:  "
-              f"tr_buckets={fold_res['tr_buckets']}  val_buckets={fold_res['val_buckets']}  "
-              f"α={best_a:.2f}  WLS_QLIKE={fold_res['wls_qlike']:.6f}  "
-              f"OLS_QLIKE={fold_res['ols_qlike']:.6f}")
-
-    cv_df = pd.DataFrame(cv_results)
-    best_alpha_cv = (cv_df.loc[cv_df["wls_qlike"].idxmin(), "best_alpha"]
-                     if len(cv_df) > 0 else 0.99)
-    return cv_results, float(best_alpha_cv)
-
-
-def print_cv_summary(cv_results, label=""):
-    """Pretty-print mean ± std of CV metrics."""
-    if not cv_results:
-        print("  [CV] No results to summarise.")
-        return
-    cv_df = pd.DataFrame(cv_results)
-    print(f"\n  ── CV SUMMARY  {label} ──")
-    print(f"  {'Metric':<20} {'Mean':>10}  {'Std':>10}  {'Min':>10}  {'Max':>10}")
-    print("  " + "─" * 60)
-    for col in ["wls_qlike", "wls_mse", "wls_mae", "ols_qlike", "best_alpha"]:
-        print(f"  {col:<20} {cv_df[col].mean():>10.6f}  "
-              f"{cv_df[col].std():>10.6f}  "
-              f"{cv_df[col].min():>10.6f}  "
-              f"{cv_df[col].max():>10.6f}")
-    print(f"\n  Fold details:")
-    for _, r in cv_df.iterrows():
-        print(f"    Fold {int(r['fold'])}: "
-              f"train_buckets={r['tr_buckets']}  val_buckets={r['val_buckets']}  "
-              f"n_train={int(r['n_train'])}  n_val={int(r['n_val'])}  "
-              f"α={r['best_alpha']:.2f}  QLIKE={r['wls_qlike']:.6f}")
-
-
-def plot_cv_results(cv_results, title, save_path):
-    """Bar chart of per-fold WLS vs OLS QLIKE."""
-    if not cv_results:
-        return
-    cv_df = pd.DataFrame(cv_results)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.patch.set_facecolor(C_BG)
-    fig.suptitle(title, fontsize=12, fontweight="bold", color=C_BLUE)
-
-    x = np.arange(len(cv_df))
-    w = 0.35
-    axes[0].bar(x - w/2, cv_df["wls_qlike"], w, color=C_TEAL, alpha=0.82, label="WLS")
-    axes[0].bar(x + w/2, cv_df["ols_qlike"], w, color=C_ORANGE, alpha=0.82, label="OLS")
-    axes[0].axhline(cv_df["wls_qlike"].mean(), color=C_TEAL,   linestyle="--", lw=1.2,
-                    label=f"WLS mean={cv_df['wls_qlike'].mean():.4f}")
-    axes[0].axhline(cv_df["ols_qlike"].mean(), color=C_ORANGE, linestyle="--", lw=1.2,
-                    label=f"OLS mean={cv_df['ols_qlike'].mean():.4f}")
-    axes[0].set_xticks(x); axes[0].set_xticklabels([f"Fold {i+1}" for i in x])
-    axes[0].set_title("QLIKE per CV Fold"); axes[0].set_ylabel("QLIKE")
-    axes[0].legend(fontsize=8); axes[0].set_facecolor(C_BG)
-
-    axes[1].bar(x, cv_df["best_alpha"], color=C_BLUE, alpha=0.82, edgecolor="none")
-    axes[1].axhline(cv_df["best_alpha"].mean(), color=C_RED, linestyle="--", lw=1.2,
-                    label=f"Mean α={cv_df['best_alpha'].mean():.3f}")
-    axes[1].set_xticks(x); axes[1].set_xticklabels([f"Fold {i+1}" for i in x])
-    axes[1].set_title("Best α per CV Fold"); axes[1].set_ylabel("α")
-    axes[1].legend(fontsize=8); axes[1].set_facecolor(C_BG)
-    axes[1].set_ylim(0, 1.05)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight"); plt.show()
-    print(f"  Saved: {save_path}  ✓")
-
-
-# ═════════════════════════════════════════════════════════════════════
-# LOAD FULL DATASET
-
-df_full = pd.read_csv(OUT + "optiver_aggregated.csv")
-df_full = df_full[df_full["time_bucket"] > 0].copy()
-df_full = df_full.rename(columns={
-    "WAP_mean": "wap", "BidAskSpread_mean": "bas", "volatility": "rv"})
-df_full = df_full.sort_values(["stock_id","time_id","time_bucket"]).reset_index(drop=True)
-print(f"  Full dataset (bucket-0 dropped): {df_full.shape}")
-print(f"  Unique stocks  : {df_full['stock_id'].nunique()}")
-print(f"  Unique time_ids: {df_full['time_id'].nunique()}")
 
 # ─────────────────────────────────────────────────────────────────────
-# RANDOM time_id SUBSAMPLE
-# Rationale: 300 time_ids gives ~300 × 20 buckets = 6,000 rows per stock,
-# which is large enough for stable CV estimates while keeping runtime
-# to a few minutes on a laptop. Seed is fixed so results are reproducible.
+# SPLIT HELPERS
 # ─────────────────────────────────────────────────────────────────────
-all_time_ids = sorted(df_full["time_id"].unique())
-rng = np.random.default_rng(RANDOM_SEED)
+def get_holdout_split(df: pd.DataFrame):
+    """
+    Apply the shared 80/20 holdout split.
 
-if len(all_time_ids) > N_TIME_IDS:
-    sampled_time_ids = sorted(rng.choice(all_time_ids, size=N_TIME_IDS, replace=False).tolist())
-    df_full = df_full[df_full["time_id"].isin(sampled_time_ids)].copy()
-    print(f"\n  ── TIME_ID SUBSAMPLE ──")
-    print(f"  Sampled {N_TIME_IDS} of {len(all_time_ids)} time_ids  (seed={RANDOM_SEED})")
-    print(f"  Sampled time_ids: {sampled_time_ids}")
-else:
-    sampled_time_ids = all_time_ids
-    print(f"  Using all {len(all_time_ids)} time_ids (fewer than requested {N_TIME_IDS})")
+    Train : time_bucket in TRAIN_BUCKETS (1–16)
+    Test  : time_bucket in TEST_BUCKETS  (17–20)
 
-print(f"  Dataset after time_id filter: {df_full.shape}")
+    Returns
+    -------
+    train_df, test_df
+    """
+    train = df[df["time_bucket"].isin(TRAIN_BUCKETS)].copy()
+    test  = df[df["time_bucket"].isin(TEST_BUCKETS)].copy()
+    return train, test
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Jamie's WLS BASELINE + CV  (stock_id = 1 only)
+def get_cv_folds(df: pd.DataFrame):
+    """
+    Yield the 5 shared CV folds from CV_FOLDS.
 
-df1 = df_full[df_full["stock_id"] == 1].copy()
-print(f"  stock_id=1 rows: {len(df1):,}")
+    Each fold yields (fold_num, train_df, val_df) where
+    train and val are subsets of the HOLDOUT TRAIN set only
+    (time_bucket 1–16). The holdout test set (17–20) is never
+    touched during CV.
 
-train1, test1, sorted_b1, n_train1, train_max1 = train_val_split(df1)
-print(f"  Holdout split — Train buckets: 1–{train_max1}  |  Test buckets: {train_max1+1}–{sorted_b1[-1]}")
-print(f"  Train rows: {len(train1):,}   Test rows: {len(test1):,}")
+    Usage
+    -----
+        for fold_num, tr, val in get_cv_folds(train_df):
+            # fit on tr, evaluate on val
+    """
+    for fold_num, tr_buckets, val_buckets in CV_FOLDS:
+        tr  = df[df["time_bucket"].isin(tr_buckets)].copy()
+        val = df[df["time_bucket"].isin(val_buckets)].copy()
+        yield fold_num, tr, val
 
-print("  Engineering features …")
-train1 = add_features(train1);  test1 = add_features(test1)
 
-bas_q33_1 = train1["bas"].quantile(0.33); bas_q66_1 = train1["bas"].quantile(0.66)
-act_q33_1 = train1["log_activity"].quantile(0.33); act_q66_1 = train1["log_activity"].quantile(0.66)
-train1 = label_bucket_liquidity(train1, bas_q33_1, bas_q66_1, act_q33_1, act_q66_1)
-test1  = label_bucket_liquidity(test1,  bas_q33_1, bas_q66_1, act_q33_1, act_q66_1)
+def get_regime_stocks(regime: str) -> list:
+    """
+    Return the list of demo stock_ids for a given regime.
+
+    Parameters
+    ----------
+    regime : str  — one of 'liquid', 'mixed', 'illiquid'
+    """
+    mapping = {
+        "liquid":   LIQUID_STOCKS,
+        "mixed":    MIXED_STOCKS,
+        "illiquid": ILLIQUID_STOCKS,
+    }
+    if regime not in mapping:
+        raise ValueError(f"regime must be one of {list(mapping.keys())}, got '{regime}'")
+    return mapping[regime]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# QUICK SANITY CHECK  (run this file directly to verify)
+# ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 65)
+    print("SHARED DATA CONFIG — SANITY CHECK")
+    print("=" * 65)
+
+    print(f"\n  SAMPLED_TIME_IDS  : {len(SAMPLED_TIME_IDS)} time_ids  (seed={RANDOM_SEED})")
+    print(f"  First 10          : {SAMPLED_TIME_IDS[:10]}")
+    print(f"  Last  10          : {SAMPLED_TIME_IDS[-10:]}")
+
+    print(f"\n  LIQUID stocks     ({len(LIQUID_STOCKS):>2}) : {LIQUID_STOCKS}")
+    print(f"  MIXED  stocks     ({len(MIXED_STOCKS):>2}) : {MIXED_STOCKS}")
+    print(f"  ILLIQUID stocks   ({len(ILLIQUID_STOCKS):>2}) : {ILLIQUID_STOCKS}")
+    print(f"  DEMO_STOCKS total ({len(DEMO_STOCKS):>2}) : {DEMO_STOCKS}")
+
+    print(f"\n  HOLDOUT SPLIT:")
+    print(f"    Train buckets : {TRAIN_BUCKETS}  (n={len(TRAIN_BUCKETS)})")
+    print(f"    Test  buckets : {TEST_BUCKETS}   (n={len(TEST_BUCKETS)})")
+
+    print(f"\n  {N_CV_FOLDS}-FOLD CV FOLDS (applied within training set only):")
+    for fold_num, tr_b, val_b in CV_FOLDS:
+        print(f"    Fold {fold_num}: train_buckets={tr_b[0]}–{tr_b[-1]}  "
+              f"val_buckets={val_b[0]}–{val_b[-1]}")
+
+    print(f"\n  REGIME_MAP sample (first 10 stocks):")
+    for sid in DEMO_STOCKS[:10]:
+        print(f"    stock_id={sid:<4}  regime={REGIME_MAP[sid]:<10}  "
+              f"recommended={MODEL_MAP[REGIME_MAP[sid]]}")
+
+    print(f"\n  All checks passed ✓")
+    print("=" * 65)
